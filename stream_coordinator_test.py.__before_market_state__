@@ -1,0 +1,78 @@
+from fastapi import FastAPI
+import uvicorn
+import urllib.request
+import json
+import time
+
+APP = FastAPI(title="stream-coordinator-test")
+
+WORKERS = [
+    {"symbol": "AUDNZD_otc", "url": "http://127.0.0.1:8011/status"},
+    {"symbol": "EURCHF_otc", "url": "http://127.0.0.1:8013/status"},
+    {"symbol": "CHFJPY_otc", "url": "http://127.0.0.1:8014/status"},
+]
+
+def fetch_json(url: str):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        return json.loads(raw)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+@APP.get("/status")
+def status():
+    items = []
+    now = time.time()
+
+    for w in WORKERS:
+        data = fetch_json(w["url"])
+        item = {
+            "symbol": w["symbol"],
+            "worker_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
+            "worker_url": w["url"],
+            "fetched_at": now,
+        }
+
+        if isinstance(data, dict) and data.get("ok"):
+            item.update({
+                "active_mode": data.get("active_mode"),
+                "stream_closed_len": data.get("stream_closed_len"),
+                "has_stream_current": data.get("has_stream_current"),
+                "tick_feed": data.get("tick_feed"),
+                "last_closed": data.get("last_closed"),
+                "current": data.get("current"),
+            })
+        else:
+            item["error"] = data.get("error", "worker_unavailable") if isinstance(data, dict) else "invalid_worker_response"
+
+        items.append(item)
+
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
+
+@APP.get("/api/coord/status")
+def coord_status():
+    raw = status()
+    simple = []
+    for item in raw["items"]:
+        simple.append({
+            "symbol": item["symbol"],
+            "worker_ok": item.get("worker_ok"),
+            "active_mode": item.get("active_mode"),
+            "stream_closed_len": item.get("stream_closed_len"),
+            "has_stream_current": item.get("has_stream_current"),
+        })
+    return {
+        "ok": True,
+        "items": simple,
+    }
+
+def main():
+    uvicorn.run(APP, host="127.0.0.1", port=8020, log_level="info")
+
+if __name__ == "__main__":
+    main()

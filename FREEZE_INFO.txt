@@ -1,0 +1,19 @@
+BOT-SRDCE FREEZE INFO
+
+Created: 2026-04-27T16:36:10
+Path: /Users/macbook/bot-srdce
+
+GIT BRANCH:
+no-git-branch
+
+GIT COMMIT:
+no-git-commit
+
+IMPORTANT FILES:
+- app/main.py: YES
+- dual_stream_test.py: YES
+- stream_coordinator_test.py: YES
+- run_stack_watchdog.py: YES
+- start_main_tg.sh: YES
+- HANDOFF_NEW_CHAT.txt: YES
+- FREEZE_INFO.txt: NO

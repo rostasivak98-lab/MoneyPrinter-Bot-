@@ -1,0 +1,1264 @@
+import os
+import time
+import json
+import asyncio
+import inspect
+import datetime
+import logging
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any, Tuple, Set
+
+from fastapi import FastAPI, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+
+from pocketoptionapi_async import AsyncPocketOptionClient
+from playwright.async_api import async_playwright
+
+logging.getLogger("pocketoptionapi_async").setLevel(logging.ERROR)
+logging.getLogger("websockets").setLevel(logging.ERROR)
+logging.getLogger("playwright").setLevel(logging.ERROR)
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+APP_NAME = "New Chance"
+
+TF_SEC = int(os.getenv("PO_TF_SEC", "60"))
+SYMBOL_DEFAULT = os.getenv("PO_SYMBOL", "CHFJPY_otc")
+IS_DEMO = os.getenv("PO_IS_DEMO", "1").strip() in ("1", "true", "True", "yes", "YES")
+LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Prague")
+SSID_FILE = os.getenv("PO_SSID_FILE", "po_ssid.txt")
+
+FRESH_MAX_SEC = int(os.getenv("PO_FRESH_MAX_SEC", "120"))
+PO_TIME_OFFSET_SEC = int(os.getenv("PO_TIME_OFFSET_SEC", "7200"))
+
+PO_USE_PW = os.getenv("PO_USE_PLAYWRIGHT", "1").strip() in ("1", "true", "True", "yes", "YES")
+PO_PW_HEADLESS = os.getenv("PO_PW_HEADLESS", "0").strip() in ("1", "true", "True", "yes", "YES")
+PO_PW_URL = os.getenv("PO_PW_URL", "https://pocketoption.com/en/cabinet/demo-quick-high-low/").strip()
+PO_PW_PROFILE_DIR = os.path.expanduser(os.getenv("PO_PW_PROFILE_DIR", "~/.newchance_pw_profile"))
+PO_PW_BROWSER = os.getenv("PO_PW_BROWSER", "webkit").strip().lower()  # chromium | webkit
+
+# Warmup
+WARMUP_GRACE_SEC = float(os.getenv("PO_WARMUP_GRACE_SEC", "2"))
+
+# HA seed
+HA_SEED_FILE = os.getenv("PO_HA_SEED_FILE", "ha_seed.json")
+
+# WATCHDOG (AUTO, with start-grace)
+WD_ENABLED = os.getenv("PO_WD_ENABLED", "1").strip() in ("1", "true", "True", "yes", "YES")
+WD_TICK_MAX_AGE_SEC = float(os.getenv("PO_WD_TICK_MAX_AGE_SEC", "8"))
+WD_FAILS_REQUIRED = int(os.getenv("PO_WD_FAILS_REQUIRED", "3"))
+WD_COOLDOWN_SEC = float(os.getenv("PO_WD_COOLDOWN_SEC", "60"))
+WD_START_GRACE_SEC = float(os.getenv("PO_WD_START_GRACE_SEC", "360"))  # ignore no_ticks_yet this long after engine start
+
+print(f"LOADED New Chance main.py WATCHDOG+GRACE ✅ browser={PO_PW_BROWSER} symbol={SYMBOL_DEFAULT}")
+
+
+def _now_ts() -> int:
+    return int(time.time())
+
+
+def _align(ts: int) -> int:
+    return ts - (ts % TF_SEC)
+
+
+def _fmt(ts_epoch: int) -> str:
+    try:
+        if ZoneInfo:
+            dt = datetime.datetime.fromtimestamp(ts_epoch, tz=ZoneInfo(LOCAL_TZ))
+        else:
+            dt = datetime.datetime.fromtimestamp(ts_epoch)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ts_epoch)
+
+
+def _open_close_str(ts_open: int) -> Tuple[str, str]:
+    return _fmt(ts_open), _fmt(ts_open + TF_SEC)
+
+
+def _age_sec(ts_open: int) -> int:
+    close_ts = ts_open + TF_SEC
+    age = _now_ts() - close_ts
+    return 0 if age < 0 else int(age)
+
+
+def _read_ssid() -> Optional[str]:
+    ssid_env = os.getenv("PO_SSID")
+    if ssid_env and ssid_env.strip():
+        return ssid_env.strip()
+    try:
+        with open(SSID_FILE, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    return ln
+        return None
+    except Exception:
+        return None
+
+
+def _norm(s: str) -> str:
+    s = (s or "").lower()
+    out = []
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+    return "".join(out)
+
+
+@dataclass
+class StreamStats:
+    ticks_seen: int = 0
+    last_tick_local: Optional[float] = None
+    last_tick_ts_raw: Optional[float] = None
+    last_tick_ts_used: Optional[float] = None
+    last_tick_price: Optional[float] = None
+
+
+@dataclass
+class TickFeedStats:
+    enabled: bool = PO_USE_PW
+    running: bool = False
+    last_err: str = "—"
+    url: str = PO_PW_URL
+    headless: bool = PO_PW_HEADLESS
+    profile_dir: str = PO_PW_PROFILE_DIR
+    browser: str = PO_PW_BROWSER
+
+    ws_seen: int = 0
+    frames_seen: int = 0
+    frames_last_ts: Optional[float] = None
+
+    pending_event: Optional[str] = None
+    pending_ts: Optional[float] = None
+
+    asset_id_for_symbol: Optional[int] = None
+    asset_map_size: int = 0
+
+    last_tick_event: Optional[str] = None
+    tick_time_mode: str = "unknown"
+
+    ticks_seen: int = 0
+    last_price: Optional[float] = None
+    last_tick_ts_raw: Optional[float] = None
+    last_tick_ts_used: Optional[float] = None
+    last_tick_local_ts: Optional[float] = None
+    last_tick_age_sec: Optional[float] = None
+
+    warmup_active: bool = False
+    warmup_until_open_ts: Optional[int] = None
+    warmup_note: str = "—"
+
+    frames_tail: List[Dict[str, Any]] = None
+
+
+@dataclass
+class State:
+    running: bool = False
+    connected: bool = False
+    symbol: str = SYMBOL_DEFAULT
+    is_demo: bool = IS_DEMO
+    tf_sec: int = TF_SEC
+    local_tz: str = LOCAL_TZ
+    fresh_max_sec: int = FRESH_MAX_SEC
+    po_time_offset_sec: int = PO_TIME_OFFSET_SEC
+
+    last_connect_error: str = "—"
+    last_candles_error: str = "—"
+    last_fetch_count: int = 0
+    last_poll_ts: Optional[float] = None
+
+    history_closed: List[Dict[str, Any]] = None
+
+    stream_current: Optional[Dict[str, Any]] = None
+    stream_closed: List[Dict[str, Any]] = None
+    stream: StreamStats = None
+
+    active_mode: str = "HISTORY"
+    history_age_sec: Optional[int] = None
+    stream_age_sec: Optional[int] = None
+
+    tick_feed: TickFeedStats = None
+
+    # watchdog telemetry
+    wd_enabled: bool = WD_ENABLED
+    wd_tick_max_age_sec: float = WD_TICK_MAX_AGE_SEC
+    wd_fails_required: int = WD_FAILS_REQUIRED
+    wd_cooldown_sec: float = WD_COOLDOWN_SEC
+    wd_start_grace_sec: float = WD_START_GRACE_SEC
+
+    wd_bad_count: int = 0
+    wd_last_restart_ts: Optional[float] = None
+    wd_last_reason: str = "—"
+    wd_engine_start_ts: Optional[float] = None
+
+
+app = FastAPI(title=APP_NAME)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+STATE = State(
+    history_closed=[],
+    stream_current=None,
+    stream_closed=[],
+    stream=StreamStats(),
+    tick_feed=TickFeedStats(frames_tail=[]),
+)
+
+_engine_task: Optional[asyncio.Task] = None
+_tick_task: Optional[asyncio.Task] = None
+_stop_event = asyncio.Event()
+_lock = asyncio.Lock()
+
+_ASSET_ID_TO_SYMBOL: Dict[int, str] = {}
+_SEEN_SYMBOLS: Set[str] = set()
+
+_HA_SEEDS: Dict[str, Dict[str, Any]] = {}
+
+
+def _load_ha_seeds() -> None:
+    global _HA_SEEDS
+    try:
+        if not os.path.exists(HA_SEED_FILE):
+            _HA_SEEDS = {}
+            return
+        with open(HA_SEED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _HA_SEEDS = data if isinstance(data, dict) else {}
+    except Exception:
+        _HA_SEEDS = {}
+
+
+def _save_ha_seeds() -> None:
+    try:
+        with open(HA_SEED_FILE, "w", encoding="utf-8") as f:
+            json.dump(_HA_SEEDS, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# --- AUTOSAVE HA SEED (fresh) -----------------------------------------------
+
+from typing import Optional
+_LAST_AUTOSAVED_SEED_TS: Optional[int] = None
+
+def _autosave_ha_seed_from_last_closed(reason: str = "autosave") -> bool:
+    """Persist a fresh HA seed based on the most recent closed candle."""
+    global _LAST_AUTOSAVED_SEED_TS
+
+    closed = STATE.stream_closed if getattr(STATE, "active_mode", None) == "STREAM" else STATE.history_closed
+    if not closed:
+        return False
+
+    # pick last minute-aligned closed candle (timestamp % 60 == 0)
+
+    last = None
+
+    for _c in reversed(closed):
+
+        try:
+
+            _ts = int((_c.get("timestamp") if isinstance(_c, dict) else getattr(_c, "timestamp", 0)) or 0)
+
+        except Exception:
+
+            _ts = 0
+
+        if _ts > 0 and (_ts % 60) == 0:
+
+            last = _c
+
+            break
+
+    if last is None:
+
+        last = closed[-1]
+
+    try:
+        last_with_ha = _attach_ha(dict(last))
+    except Exception:
+        return False
+
+    ts = int(last_with_ha.get("timestamp") or 0)
+    ha_open = last_with_ha.get("ha_open")
+    ha_close = last_with_ha.get("ha_close")
+
+    if ts <= 0 or ha_open is None or ha_close is None:
+        return False
+
+    if _LAST_AUTOSAVED_SEED_TS == ts:
+        return False
+
+    sym = getattr(STATE, "symbol", None) or last_with_ha.get("symbol")
+    if not sym:
+        return False
+
+    _HA_SEEDS[sym] = {
+        "timestamp": ts,
+        "ha_open": float(ha_open),
+        "ha_close": float(ha_close),
+        "updated_at": time.time(),
+        "reason": reason,
+    }
+    _save_ha_seeds()
+    _LAST_AUTOSAVED_SEED_TS = ts
+    return True
+
+_load_ha_seeds()
+
+
+def _get_seed_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    s = _HA_SEEDS.get(symbol)
+    return s if isinstance(s, dict) else None
+
+
+def _history_limit_from_seed(default: int = 120, maximum: int = 1500) -> int:
+    seed = _get_seed_for_symbol(STATE.symbol)
+    if not isinstance(seed, dict):
+        return default
+    try:
+        seed_ts = int(seed.get("timestamp") or 0)
+    except Exception:
+        return default
+    if seed_ts <= 0:
+        return default
+    age_sec = max(0, int(time.time()) - seed_ts)
+    need = int(age_sec // 60) + 20
+    if need < default:
+        return default
+    if need > maximum:
+        return maximum
+    return need
+
+
+def _pick_last_history() -> Optional[Dict[str, Any]]:
+    return STATE.history_closed[-1] if STATE.history_closed else None
+
+
+def _pick_last_stream_closed() -> Optional[Dict[str, Any]]:
+    return STATE.stream_closed[-1] if STATE.stream_closed else None
+
+
+def _update_hybrid_choice() -> None:
+    h = _pick_last_history()
+    s = _pick_last_stream_closed()
+    STATE.history_age_sec = _age_sec(int(h["timestamp"])) if h else None
+    STATE.stream_age_sec = _age_sec(int(s["timestamp"])) if s else None
+
+    tf = STATE.tick_feed
+    tick_fresh = (tf.last_tick_local_ts is not None) and ((time.time() - tf.last_tick_local_ts) <= 3.0)
+    stream_ready = s is not None and len(STATE.stream_closed or []) >= 2
+
+    # IMPORTANT:
+    # After restart, first closed STREAM candle acts as bridge for HA chaining.
+    # Switch output to STREAM only when we have at least 2 closed STREAM candles.
+    if tick_fresh and stream_ready:
+        STATE.active_mode = "STREAM"
+        return
+
+    if STATE.history_age_sec is not None and STATE.history_age_sec <= STATE.fresh_max_sec:
+        STATE.active_mode = "HISTORY"
+    else:
+        STATE.active_mode = "STREAM" if stream_ready else "HISTORY"
+
+
+def _active_last_closed() -> Optional[Dict[str, Any]]:
+    if STATE.active_mode == "STREAM":
+        return _pick_last_stream_closed() or _pick_last_history()
+    return _pick_last_history() or _pick_last_stream_closed()
+
+
+def _append_stream_closed(c: Dict[str, Any]) -> None:
+    lst = STATE.stream_closed or []
+    lst.append(c)
+    if len(lst) > 500:
+        lst = lst[-500:]
+    STATE.stream_closed = lst
+
+
+def _calibrate_tick_ts(ts_raw: float) -> Tuple[float, str]:
+    now = time.time()
+    diff = ts_raw - now
+    if abs(diff - float(STATE.po_time_offset_sec)) <= 600:
+        return (ts_raw - float(STATE.po_time_offset_sec), "minus_offset")
+    if abs(diff) <= 600:
+        return (ts_raw, "raw")
+    return (ts_raw, "unknown")
+
+
+def _ts_open_from_tick(ts_used: float) -> int:
+    return _align(int(ts_used))
+
+
+def _maybe_init_warmup(ts_used: float) -> None:
+    tf = STATE.tick_feed
+    if tf.warmup_until_open_ts is not None:
+        return
+
+    ts_open = _ts_open_from_tick(ts_used)
+    sec_into_minute = float(ts_used) - float(ts_open)
+
+    if sec_into_minute <= WARMUP_GRACE_SEC:
+        tf.warmup_active = False
+        tf.warmup_until_open_ts = ts_open
+        tf.warmup_note = f"disabled (start at +{sec_into_minute:.2f}s)"
+        return
+
+    tf.warmup_active = True
+    tf.warmup_until_open_ts = ts_open + TF_SEC
+    tf.warmup_note = f"active until {_fmt(tf.warmup_until_open_ts)} (start at +{sec_into_minute:.2f}s)"
+
+
+def _start_new_stream_candle(ts_open: int, price: float) -> None:
+    STATE.stream_current = {
+        "symbol": STATE.symbol,
+        "timestamp": ts_open,
+        "open": float(price),
+        "high": float(price),
+        "low": float(price),
+        "close": float(price),
+        "volume": 1.0,
+        "source": "STREAM_FORMING",
+        "open_time": _open_close_str(ts_open)[0],
+        "close_time": _open_close_str(ts_open)[1],
+    }
+
+
+def _on_tick_for_active_symbol(ts_raw: float, price: float, event_name: Optional[str] = None) -> None:
+    ts_used, mode = _calibrate_tick_ts(float(ts_raw))
+    tf = STATE.tick_feed
+    _maybe_init_warmup(ts_used)
+
+    STATE.stream.ticks_seen += 1
+    STATE.stream.last_tick_local = time.time()
+    STATE.stream.last_tick_ts_raw = float(ts_raw)
+    STATE.stream.last_tick_ts_used = float(ts_used)
+    STATE.stream.last_tick_price = float(price)
+
+    tf.ticks_seen += 1
+    tf.last_price = float(price)
+    tf.last_tick_ts_raw = float(ts_raw)
+    tf.last_tick_ts_used = float(ts_used)
+    tf.last_tick_local_ts = time.time()
+    tf.last_tick_age_sec = 0.0
+    tf.last_tick_event = event_name or tf.last_tick_event
+    tf.tick_time_mode = mode
+
+    ts_open = _ts_open_from_tick(ts_used)
+    cur = STATE.stream_current
+
+    if tf.warmup_active and tf.warmup_until_open_ts is not None:
+        if ts_open < tf.warmup_until_open_ts:
+            if cur is None or int(cur["timestamp"]) != ts_open:
+                _start_new_stream_candle(ts_open, price)
+            else:
+                cur["high"] = max(cur["high"], float(price))
+                cur["low"] = min(cur["low"], float(price))
+                cur["close"] = float(price)
+                cur["volume"] = float(cur.get("volume", 0.0) + 1.0)
+                STATE.stream_current = cur
+            return
+
+        if ts_open == tf.warmup_until_open_ts:
+            tf.warmup_active = False
+            tf.warmup_note = f"done at {_fmt(ts_open)}"
+            _start_new_stream_candle(ts_open, price)
+            # warmup_done autosave disabled; keep last persisted minute_close seed
+            return
+
+        tf.warmup_active = False
+        tf.warmup_note = f"forced-off at {_fmt(ts_open)}"
+
+    if cur and int(cur["timestamp"]) == ts_open:
+        cur["high"] = max(cur["high"], float(price))
+        cur["low"] = min(cur["low"], float(price))
+        cur["close"] = float(price)
+        cur["volume"] = float(cur.get("volume", 0.0) + 1.0)
+        STATE.stream_current = cur
+        return
+
+    if cur and cur.get("timestamp") is not None:
+        prev_ts = int(cur["timestamp"])
+        o, c = _open_close_str(prev_ts)
+        closed = {
+            "symbol": STATE.symbol,
+            "timestamp": prev_ts,
+            "open": float(cur["open"]),
+            "high": float(cur["high"]),
+            "low": float(cur["low"]),
+            "close": float(cur["close"]),
+            "volume": float(cur.get("volume", 0.0)),
+            "source": "STREAM",
+            "open_time": o,
+            "close_time": c,
+            "age_sec": _age_sec(prev_ts),
+        }
+        _append_stream_closed(closed)
+
+        _autosave_ha_seed_from_last_closed(reason="minute_close")
+    _start_new_stream_candle(ts_open, price)
+
+
+def _parse_json_from_anyframe(s: str) -> Optional[Any]:
+    if not s:
+        return None
+    i = s.find("[")
+    j = s.find("{")
+    if i == -1 and j == -1:
+        return None
+    start = min([x for x in (i, j) if x != -1])
+    end = max(s.rfind("]"), s.rfind("}"))
+    if end == -1 or end <= start:
+        return None
+    raw = s[start:end + 1]
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _extract_socketio_event_name_if_placeholder(s: str) -> Optional[str]:
+    if not s or '"_placeholder"' not in s:
+        return None
+    k = s.find('["')
+    if k == -1:
+        return None
+    k += 2
+    m = s.find('"', k)
+    if m == -1:
+        return None
+    return s[k:m]
+
+
+def _maybe_ingest_assets(event_name: Optional[str], payload: Any) -> None:
+    if event_name != "updateAssets":
+        return
+    if not isinstance(payload, list):
+        return
+    for it in payload:
+        if not (isinstance(it, list) and len(it) >= 2):
+            continue
+        try:
+            aid = int(it[0])
+        except Exception:
+            continue
+        cand = it[1] if isinstance(it[1], str) else None
+        if not cand and len(it) >= 3 and isinstance(it[2], str):
+            cand = it[2]
+        if cand:
+            _ASSET_ID_TO_SYMBOL[aid] = cand
+
+    STATE.tick_feed.asset_map_size = len(_ASSET_ID_TO_SYMBOL)
+
+    target_norm = _norm(STATE.symbol)
+    if STATE.tick_feed.asset_id_for_symbol is None:
+        for aid, name in _ASSET_ID_TO_SYMBOL.items():
+            if _norm(name) == target_norm or target_norm in _norm(name):
+                STATE.tick_feed.asset_id_for_symbol = aid
+                break
+
+
+def _sanitize_preview(s: str) -> str:
+    if not s:
+        return s
+    if '["auth"' in s or '["user_init"' in s:
+        return "(redacted auth frame)"
+    return s
+
+
+def _feed_frame_preview(preview: str, kind: str) -> None:
+    tf = STATE.tick_feed
+    tf.frames_seen += 1
+    tf.frames_last_ts = time.time()
+    tail = tf.frames_tail or []
+    tail.append({"ts": tf.frames_last_ts, "kind": kind, "preview": _sanitize_preview(preview)[:160]})
+    if len(tail) > 10:
+        tail = tail[-10:]
+    tf.frames_tail = tail
+
+
+def _try_pick_tick_triplet(it: Any) -> Optional[Tuple[str, float, float]]:
+    if not (isinstance(it, list) and len(it) >= 3):
+        return None
+    sym = it[0]
+    try:
+        ts = float(it[1])
+        price = float(it[2])
+        if ts < 1_000_000_000:
+            return None
+    except Exception:
+        return None
+
+    if isinstance(sym, (int, float)):
+        name = _ASSET_ID_TO_SYMBOL.get(int(sym))
+        sym_str = name if name else str(int(sym))
+    else:
+        sym_str = str(sym)
+
+    return (sym_str, ts, price)
+
+
+def _find_ticks_recursive(obj: Any, limit: int = 50) -> List[Tuple[str, float, float]]:
+    out: List[Tuple[str, float, float]] = []
+
+    def walk(x: Any):
+        nonlocal out
+        if len(out) >= limit:
+            return
+        if isinstance(x, list):
+            t = _try_pick_tick_triplet(x)
+            if t:
+                out.append(t)
+                return
+            for y in x:
+                walk(y)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+
+    walk(obj)
+    return out
+
+
+def _ha_for_series_seeded(closed: List[Dict[str, Any]], seed: Optional[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    if not closed:
+        return out
+
+    candles = sorted(closed, key=lambda c: int(c.get("timestamp", 0)))
+
+    seed_ts = None
+    seed_open = None
+    seed_close = None
+    if isinstance(seed, dict):
+        try:
+            seed_ts = int(seed.get("timestamp"))
+            seed_open = float(seed.get("ha_open"))
+            seed_close = float(seed.get("ha_close"))
+        except Exception:
+            seed_ts = None
+            seed_open = None
+            seed_close = None
+
+    # IMPORTANT:
+    # If we have a seed, HA must be chained only from that seed forward.
+    # Older candles must not influence the chain after restart.
+    if seed_ts is not None and seed_open is not None and seed_close is not None:
+        trimmed = []
+        for c in candles:
+            try:
+                ts = int(c.get("timestamp", 0))
+            except Exception:
+                ts = 0
+            if ts >= seed_ts:
+                trimmed.append(c)
+        if trimmed:
+            candles = trimmed
+
+    prev_ha_open: Optional[float] = None
+    prev_ha_close: Optional[float] = None
+    chained_from_seed = False
+
+    if candles and seed_ts is not None and seed_open is not None and seed_close is not None:
+        first_ts = int(candles[0].get("timestamp", 0))
+        if first_ts > seed_ts:
+            prev_ha_open = seed_open
+            prev_ha_close = seed_close
+            chained_from_seed = True
+
+    for c in candles:
+        try:
+            ts = int(c["timestamp"])
+            o = float(c["open"])
+            h = float(c["high"])
+            l = float(c["low"])
+            cl = float(c["close"])
+        except Exception:
+            continue
+
+        # exact anchor candle from persisted seed
+        if seed_ts is not None and seed_open is not None and seed_close is not None and ts == seed_ts:
+            ha_open = float(seed_open)
+            ha_close = float(seed_close)
+            ha_high = max(h, ha_open, ha_close)
+            ha_low = min(l, ha_open, ha_close)
+            ha_dir = "UP" if ha_close >= ha_open else "DOWN"
+            out[ts] = {
+                "ha_open": ha_open,
+                "ha_high": ha_high,
+                "ha_low": ha_low,
+                "ha_close": ha_close,
+                "ha_dir": ha_dir,
+                "ha_seeded": True,
+            }
+            prev_ha_open = ha_open
+            prev_ha_close = ha_close
+            chained_from_seed = True
+            continue
+
+        ha_close = (o + h + l + cl) / 4.0
+
+        if prev_ha_open is None or prev_ha_close is None:
+            ha_open = (o + cl) / 2.0
+            ha_seeded = False
+        else:
+            ha_open = (prev_ha_open + prev_ha_close) / 2.0
+            ha_seeded = chained_from_seed
+
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
+        ha_dir = "UP" if ha_close >= ha_open else "DOWN"
+
+        out[ts] = {
+            "ha_open": ha_open,
+            "ha_high": ha_high,
+            "ha_low": ha_low,
+            "ha_close": ha_close,
+            "ha_dir": ha_dir,
+            "ha_seeded": ha_seeded,
+        }
+
+        prev_ha_open = ha_open
+        prev_ha_close = ha_close
+
+    return out
+def _merged_closed_for_ha(src: str, tail: int = 500) -> List[Dict[str, Any]]:
+    hist = list(STATE.history_closed or [])
+    stream = list(STATE.stream_closed or [])
+
+    if "STREAM" in src:
+        merged = (hist[-tail:] if hist else []) + (stream[-tail:] if stream else [])
+    else:
+        merged = (hist[-tail:] if hist else []) or (stream[-tail:] if stream else [])
+
+    by_ts: Dict[int, Dict[str, Any]] = {}
+    for c in merged:
+        try:
+            ts = int(c.get("timestamp", 0))
+        except Exception:
+            ts = 0
+        if ts > 0:
+            by_ts[ts] = c  # stream override on same timestamp
+
+    out = [by_ts[ts] for ts in sorted(by_ts.keys())]
+    if len(out) > tail:
+        out = out[-tail:]
+    return out
+
+
+def _attach_ha(candle: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if candle is None:
+        return None
+
+    src = str(candle.get("source", "")).upper()
+    series = _merged_closed_for_ha(src, tail=500)
+    seed = _get_seed_for_symbol(STATE.symbol)
+    ha_map = _ha_for_series_seeded(series, seed)
+    ts = int(candle.get("timestamp", 0))
+
+    out = dict(candle)
+    ha = ha_map.get(ts)
+    if ha:
+        out.update(ha)
+    return out
+
+
+def _debug_ha_last_payload(candle: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if candle is None:
+        return {"ok": False, "error": "no candle"}
+
+    src = str(candle.get("source", "")).upper()
+    series = _merged_closed_for_ha(src, tail=500)
+    seed = _get_seed_for_symbol(STATE.symbol)
+    ha_map = _ha_for_series_seeded(series, seed)
+
+    ts = int(candle.get("timestamp", 0))
+
+    ordered = []
+    for c in series:
+        try:
+            cts = int(c.get("timestamp", 0))
+        except Exception:
+            cts = 0
+        if cts > 0:
+            ordered.append((cts, c))
+    ordered.sort(key=lambda x: x[0])
+
+    idx = None
+    for i, (cts, _) in enumerate(ordered):
+        if cts == ts:
+            idx = i
+            break
+
+    prev_ts = ordered[idx - 1][0] if idx is not None and idx > 0 else None
+    prev_candle = ordered[idx - 1][1] if idx is not None and idx > 0 else None
+
+    cur_ha = ha_map.get(ts)
+    prev_ha = ha_map.get(prev_ts) if prev_ts is not None else None
+
+    out = {
+        "ok": True,
+        "symbol": STATE.symbol,
+        "active_mode": STATE.active_mode,
+        "source": src,
+        "seed": seed,
+        "series_len": len(ordered),
+        "series_tail_timestamps": [x[0] for x in ordered[-15:]],
+        "current_timestamp": ts,
+        "current_open_time": candle.get("open_time"),
+        "current_close_time": candle.get("close_time"),
+        "current_raw": {
+            "open": candle.get("open"),
+            "high": candle.get("high"),
+            "low": candle.get("low"),
+            "close": candle.get("close"),
+        },
+        "current_ha": cur_ha,
+        "prev_timestamp": prev_ts,
+        "prev_open_time": _fmt(prev_ts) if prev_ts else None,
+        "prev_raw": {
+            "open": prev_candle.get("open") if prev_candle else None,
+            "high": prev_candle.get("high") if prev_candle else None,
+            "low": prev_candle.get("low") if prev_candle else None,
+            "close": prev_candle.get("close") if prev_candle else None,
+        } if prev_candle else None,
+        "prev_ha": prev_ha,
+    }
+
+    if prev_ha and cur_ha:
+        try:
+            out["expected_open_from_prev"] = (float(prev_ha["ha_open"]) + float(prev_ha["ha_close"])) / 2.0
+        except Exception:
+            out["expected_open_from_prev"] = None
+    else:
+        out["expected_open_from_prev"] = None
+
+    return out
+
+async def _tick_feed_playwright_ws():
+    tf = STATE.tick_feed
+    tf.running = True
+    tf.last_err = "—"
+    tf.ws_seen = 0
+    tf.frames_seen = 0
+    tf.frames_last_ts = None
+    tf.frames_tail = []
+    tf.pending_event = None
+    tf.pending_ts = None
+    tf.asset_id_for_symbol = None
+    tf.asset_map_size = 0
+    tf.last_tick_event = None
+    tf.tick_time_mode = "unknown"
+    tf.ticks_seen = 0
+    tf.last_price = None
+    tf.last_tick_ts_raw = None
+    tf.last_tick_ts_used = None
+    tf.last_tick_local_ts = None
+    tf.last_tick_age_sec = None
+    tf.warmup_active = False
+    tf.warmup_until_open_ts = None
+    tf.warmup_note = "—"
+
+    _ASSET_ID_TO_SYMBOL.clear()
+    _SEEN_SYMBOLS.clear()
+
+    ctx = None
+    try:
+        os.makedirs(PO_PW_PROFILE_DIR, exist_ok=True)
+        async with async_playwright() as p:
+            browser = p.webkit if PO_PW_BROWSER == "webkit" else p.chromium
+            ctx = await browser.launch_persistent_context(
+                user_data_dir=PO_PW_PROFILE_DIR,
+                headless=PO_PW_HEADLESS,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            page = await ctx.new_page()
+
+            def attach_ws(ws):
+                tf.ws_seen += 1
+                ws.on("framereceived", lambda payload: _handle_payload(payload, sent=False))
+                ws.on("framesent", lambda payload: _handle_payload(payload, sent=True))
+
+            def _handle_payload(payload, sent: bool):
+                try:
+                    kind = "sent" if sent else "recv"
+
+                    if isinstance(payload, bytes):
+                        s = payload.decode("utf-8", errors="ignore")
+                        _feed_frame_preview(s, kind + ":bytes")
+                        raw_text = s
+                        obj = _parse_json_from_anyframe(s)
+                    else:
+                        s = str(payload)
+                        _feed_frame_preview(s, kind + ":str")
+                        raw_text = s
+                        obj = _parse_json_from_anyframe(s)
+
+                    ev = _extract_socketio_event_name_if_placeholder(raw_text)
+                    if ev:
+                        tf.pending_event = ev
+                        tf.pending_ts = time.time()
+
+                    if obj is None:
+                        return
+
+                    paired_event = None
+                    paired_payload = obj
+
+                    if isinstance(obj, list) and len(obj) >= 2 and isinstance(obj[0], str):
+                        paired_event = obj[0]
+                        paired_payload = obj[1]
+                    else:
+                        if (not sent) and tf.pending_event and tf.pending_ts and (time.time() - tf.pending_ts) <= 2.0:
+                            paired_event = tf.pending_event
+                            paired_payload = obj
+                            tf.pending_event = None
+                            tf.pending_ts = None
+
+                    if paired_event:
+                        _maybe_ingest_assets(paired_event, paired_payload)
+
+                    ticks = _find_ticks_recursive(paired_payload, limit=50)
+                    if not ticks:
+                        ticks = _find_ticks_recursive(obj, limit=50)
+                    if not ticks:
+                        return
+
+                    async def apply():
+                        async with _lock:
+                            active_norm = _norm(STATE.symbol)
+                            for sym_str, t, price in ticks:
+                                _SEEN_SYMBOLS.add(sym_str)
+                                if _norm(sym_str) == active_norm:
+                                    _on_tick_for_active_symbol(t, price, event_name=paired_event)
+                            _update_hybrid_choice()
+
+                    asyncio.get_event_loop().call_soon_threadsafe(lambda: asyncio.create_task(apply()))
+
+                except Exception as e:
+                    tf.last_err = f"{type(e).__name__}: {e}"
+
+            page.on("websocket", attach_ws)
+            ctx.on("websocket", attach_ws)
+
+            await page.goto(PO_PW_URL, wait_until="domcontentloaded")
+            await asyncio.sleep(2.0)
+
+            while not _stop_event.is_set():
+                if tf.last_tick_local_ts:
+                    tf.last_tick_age_sec = time.time() - tf.last_tick_local_ts
+                await asyncio.sleep(0.5)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        tf.last_err = f"{type(e).__name__}: {e}"
+    finally:
+        tf.running = False
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
+
+async def _fetch_history_closed(client: Any, limit: int = 120) -> List[Dict[str, Any]]:
+    fn = getattr(client, "get_candles", None)
+    if not callable(fn):
+        return []
+    res = fn(STATE.symbol, TF_SEC, count=limit)
+    if inspect.isawaitable(res):
+        res = await res
+    if not res:
+        return []
+
+    candles: List[Dict[str, Any]] = []
+    for x in res:
+        dt = getattr(x, "timestamp", None)
+        if not isinstance(dt, datetime.datetime):
+            continue
+        ts_open = _align(int(dt.timestamp()) - int(STATE.po_time_offset_sec))
+        o, c = _open_close_str(ts_open)
+        candles.append({
+            "symbol": STATE.symbol,
+            "timestamp": ts_open,
+            "open": float(x.open),
+            "high": float(x.high),
+            "low": float(x.low),
+            "close": float(x.close),
+            "volume": float(getattr(x, "volume", 0.0)),
+            "source": "HISTORY",
+            "open_time": o,
+            "close_time": c,
+        })
+
+    candles.sort(key=lambda cc: int(cc["timestamp"]))
+    closed = candles[:-1] if len(candles) >= 2 else []
+    for cc in closed:
+        cc["age_sec"] = _age_sec(int(cc["timestamp"]))
+    return closed[-300:]
+
+
+async def _restart_tick_feed(reason: str) -> None:
+    global _tick_task
+    if not PO_USE_PW:
+        return
+
+    now = time.time()
+    last = STATE.wd_last_restart_ts or 0.0
+    if (now - last) < STATE.wd_cooldown_sec:
+        return
+
+    STATE.wd_last_restart_ts = now
+    STATE.wd_last_reason = reason
+    STATE.wd_bad_count = 0
+
+    print(f"[WATCHDOG] restarting tick feed: {reason}")
+
+    old = _tick_task
+    _tick_task = None
+    if old is not None:
+        old.cancel()
+        try:
+            await asyncio.gather(old, return_exceptions=True)
+        except Exception:
+            pass
+
+    _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+
+
+async def _watchdog_check() -> None:
+    if not STATE.wd_enabled:
+        return
+
+    tf = STATE.tick_feed
+    now = time.time()
+
+    # compute age
+    age = tf.last_tick_age_sec
+    running = tf.running
+
+    bad = False
+    reason = "ok"
+
+    if not running:
+        bad = True
+        reason = "tick_feed_not_running"
+    elif age is None:
+        # no ticks yet -> ignore during grace period after engine start
+        start_ts = STATE.wd_engine_start_ts or now
+        if (now - start_ts) < STATE.wd_start_grace_sec:
+            bad = False
+            reason = "grace_no_ticks_yet"
+        else:
+            bad = True
+            reason = "no_ticks_yet"
+    elif age > STATE.wd_tick_max_age_sec:
+        bad = True
+        reason = f"tick_stale_age={age:.1f}s"
+
+    if bad:
+        STATE.wd_bad_count += 1
+        if STATE.wd_bad_count >= STATE.wd_fails_required:
+            await _restart_tick_feed(reason)
+    else:
+        STATE.wd_bad_count = 0
+        STATE.wd_last_reason = reason
+
+
+async def _engine_loop():
+    global _tick_task
+
+    STATE.last_connect_error = "—"
+    STATE.last_candles_error = "—"
+    STATE.last_fetch_count = 0
+    STATE.last_poll_ts = None
+
+    STATE.stream_current = None
+    STATE.stream_closed = []
+    STATE.stream = StreamStats()
+    STATE.active_mode = "HISTORY"
+    STATE.history_age_sec = None
+    STATE.stream_age_sec = None
+    STATE.tick_feed = TickFeedStats(frames_tail=[])
+
+    STATE.wd_bad_count = 0
+    STATE.wd_last_restart_ts = None
+    STATE.wd_last_reason = "—"
+    STATE.wd_engine_start_ts = time.time()
+
+    ssid = _read_ssid()
+    if not ssid:
+        STATE.connected = False
+        STATE.last_connect_error = "Missing SSID"
+        return
+
+    try:
+        client = AsyncPocketOptionClient(ssid=ssid, is_demo=STATE.is_demo, enable_logging=False)
+        await client.connect()
+        STATE.connected = True
+    except Exception as e:
+        STATE.connected = False
+        STATE.last_connect_error = f"{type(e).__name__}: {e}"
+        return
+
+    if PO_USE_PW:
+        _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+    else:
+        _tick_task = None
+
+    last_hist = 0.0
+
+    while not _stop_event.is_set():
+        now = time.time()
+        STATE.last_poll_ts = now
+
+        try:
+            await _watchdog_check()
+        except Exception:
+            pass
+
+        if (now - last_hist) >= 2.0:
+            last_hist = now
+            try:
+                hist_closed = await _fetch_history_closed(client, limit=_history_limit_from_seed(default=120, maximum=1500))
+                async with _lock:
+                    STATE.history_closed = hist_closed
+                    STATE.last_fetch_count = len(hist_closed)
+                    _update_hybrid_choice()
+                STATE.last_candles_error = "—"
+            except Exception as e:
+                STATE.last_candles_error = f"{type(e).__name__}: {e}"
+
+        await asyncio.sleep(1.0)
+
+    if _tick_task:
+        _tick_task.cancel()
+        try:
+            await asyncio.gather(_tick_task, return_exceptions=True)
+        except Exception:
+            pass
+
+    STATE.connected = False
+
+
+@app.get("/api/start")
+async def api_start():
+    global _engine_task
+    if STATE.running and _engine_task and not _engine_task.done():
+        return {"ok": True, "msg": "already running"}
+    _stop_event.clear()
+    STATE.running = True
+    _engine_task = asyncio.create_task(_engine_loop())
+    return {"ok": True, "msg": "started"}
+
+
+@app.post("/api/stop")
+async def api_stop():
+    global _engine_task
+    if not STATE.running:
+        return {"ok": True, "msg": "already stopped"}
+    _stop_event.set()
+    STATE.running = False
+    if _engine_task:
+        try:
+            await asyncio.wait_for(_engine_task, timeout=8.0)
+        except Exception:
+            pass
+    return {"ok": True, "msg": "stopped"}
+
+
+@app.post("/api/ha_seed")
+def api_ha_seed(payload: Dict[str, Any] = Body(...)):
+    try:
+        ha_open = float(payload["ha_open"])
+        ha_close = float(payload["ha_close"])
+    except Exception:
+        return {"ok": False, "error": "Missing/invalid ha_open or ha_close"}
+
+    ts = payload.get("timestamp", None)
+    if ts is None:
+        last = _active_last_closed()
+        if not last:
+            return {"ok": False, "error": "No last closed candle available to seed"}
+        ts = int(last.get("timestamp"))
+    else:
+        try:
+            ts = int(ts)
+        except Exception:
+            return {"ok": False, "error": "Invalid timestamp"}
+
+    sym = STATE.symbol
+    _HA_SEEDS[sym] = {"timestamp": ts, "ha_open": ha_open, "ha_close": ha_close, "updated_at": time.time()}
+    _save_ha_seeds()
+    return {"ok": True, "symbol": sym, "saved": _HA_SEEDS[sym]}
+
+
+@app.get("/api/tick_status")
+def api_tick_status():
+    tf = STATE.tick_feed
+    return {
+        "ok": True,
+        "symbol": STATE.symbol,
+        "tick_feed": {
+            "browser": tf.browser,
+            "running": tf.running,
+            "last_err": tf.last_err,
+            "ws_seen": tf.ws_seen,
+            "frames_seen": tf.frames_seen,
+            "ticks_seen": tf.ticks_seen,
+            "last_price": tf.last_price,
+            "last_tick_age_sec": tf.last_tick_age_sec,
+            "last_tick_event": tf.last_tick_event,
+            "tick_time_mode": tf.tick_time_mode,
+            "warmup_active": tf.warmup_active,
+            "warmup_note": tf.warmup_note,
+            "asset_id_for_symbol": tf.asset_id_for_symbol,
+            "asset_map_size": tf.asset_map_size,
+            "ha_seed_for_symbol": _get_seed_for_symbol(STATE.symbol),
+        },
+        "stream_ticks_seen": STATE.stream.ticks_seen,
+        "stream_closed_len": len(STATE.stream_closed or []),
+        "active_mode": STATE.active_mode,
+        "watchdog": {
+            "enabled": STATE.wd_enabled,
+            "tick_max_age_sec": STATE.wd_tick_max_age_sec,
+            "fails_required": STATE.wd_fails_required,
+            "cooldown_sec": STATE.wd_cooldown_sec,
+            "start_grace_sec": STATE.wd_start_grace_sec,
+            "bad_count": STATE.wd_bad_count,
+            "last_restart_ts": STATE.wd_last_restart_ts,
+            "last_reason": STATE.wd_last_reason,
+        },
+    }
+
+
+@app.get("/api/last")
+def api_last(closed: int = 0):
+    if closed == 1:
+        c = _attach_ha(_active_last_closed())
+        return {"ok": True, "closed": True, "candle": c, "active_mode": STATE.active_mode}
+    if STATE.active_mode == "STREAM" and STATE.stream_current is not None:
+        c = _attach_ha(STATE.stream_current)
+        return {"ok": True, "closed": False, "candle": c, "active_mode": STATE.active_mode}
+    c = _attach_ha(_active_last_closed())
+    return {"ok": True, "closed": True, "candle": c, "active_mode": STATE.active_mode}
+
+
+@app.get("/api/debug_ha_last")
+def api_debug_ha_last():
+    c = _active_last_closed()
+    return _debug_ha_last_payload(c)
+
+
+@app.get("/")
+def root():
+    return {"app": APP_NAME, "symbol": STATE.symbol, "watchdog": {"enabled": WD_ENABLED, "start_grace_sec": WD_START_GRACE_SEC}}

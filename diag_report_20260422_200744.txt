@@ -1,0 +1,535 @@
+===== BASIC =====
+st 22. dubna 2026 20:07:44 CEST
+/Users/macbook/bot-srdce
+Python 3.12.0
+
+===== PY COMPILE =====
+
+===== PROCESS CHECK =====
+11567
+11595
+11596
+11602
+11603
+11604
+11605
+11606
+
+COMMAND   PID    USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+Python  11567 macbook    3u  IPv4 0xa052aadf7b05ffa9      0t0  TCP 127.0.0.1:8000 (LISTEN)
+Python  11572 macbook    3u  IPv4 0xa052aadf7b05ffa9      0t0  TCP 127.0.0.1:8000 (LISTEN)
+
+===== STARTUP / LOOPS / SWITCHES IN CODE =====
+1027:async def _tick_feed_playwright_ws():
+1148:                await _pw_switch_symbol_ui(STATE.symbol)
+1193:async def _pw_switch_symbol_ui(symbol: str) -> Dict[str, Any]:
+1230:    return await _pw_switch_symbol_ui(symbol)
+1296:    _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+1338:async def _engine_loop():
+1375:        _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+1437:async def api_start():
+1446:        _engine_task = asyncio.create_task(_engine_loop())
+1451:async def api_stop():
+2633:        _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+2739:def _strategy_v1__auto_prepare_loop():
+2759:@app.on_event("startup")
+2761:    _strategy_v1__auto_prepare_loop()
+2998:async def api_symbols_switch(symbol: str):
+3045:            ui_switch_result = await _pw_switch_symbol_ui(symbol)
+3058:        _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+3063:            ui_switch_result = await _pw_switch_symbol_ui(symbol)
+3477:@app.on_event("startup")
+5701:def _tg_menu_loop():
+5720:@app.on_event("startup")
+5722:    _tg_menu_loop()
+
+===== DEBUG FUNCTION USAGE =====
+1896:def _strategy_v1__build_debug():
+2356:    debug = _strategy_v1__build_debug()
+2436:    debug = _strategy_v1__build_debug()
+2658:            debug = _strategy_v1__build_debug()
+2785:        return _strategy_v1__build_debug()
+2864:            data = _strategy_v1__build_debug()
+2916:            data = _strategy_v1__build_debug()
+4807:        debug = _strategy_v1__build_debug() or {}
+
+2763:def _strategy_v1__build_debug_for_symbol(symbol: str):
+2804:            data = _strategy_v1__build_debug_for_symbol(sym)
+
+===== API START =====
+{
+  "ok": true,
+  "msg": "already running"
+}
+
+===== TELEGRAM STATUS =====
+{
+  "ok": true,
+  "ready": true,
+  "has_token": true,
+  "has_chat_id": true
+}
+
+===== SWITCH MODE =====
+{
+  "ok": true,
+  "switch_mode": "MANUAL",
+  "active_symbol": "EURCHF_otc"
+}
+
+===== ALERTS =====
+{
+  "ok": true,
+  "alerts_enabled": false
+}
+
+===== TICK STATUS =====
+{
+  "ok": true,
+  "symbol": "EURCHF_otc",
+  "tick_feed": {
+    "browser": "webkit",
+    "running": true,
+    "last_err": "—",
+    "ws_seen": 12,
+    "frames_seen": 9996,
+    "ticks_seen": 1790,
+    "last_price": 0.9012,
+    "last_tick_age_sec": 0.0,
+    "last_tick_event": "updateStream",
+    "tick_time_mode": "minus_offset",
+    "warmup_active": false,
+    "warmup_note": "done at 2026-04-22 19:58:00",
+    "asset_id_for_symbol": 77,
+    "asset_map_size": 183,
+    "ha_seed_for_symbol": {
+      "timestamp": 1776880500,
+      "ha_open": 0.9073176669850402,
+      "ha_close": 0.9006050000000001,
+      "updated_at": 1776880680.086445,
+      "reason": "minute_close"
+    },
+    "pending_event": null,
+    "frames_tail": [
+      {
+        "ts": 1776881263.336152,
+        "kind": "recv:str",
+        "preview": "451-[\"updateStream\",{\"_placeholder\":true,\"num\":0}]"
+      },
+      {
+        "ts": 1776881263.408868,
+        "kind": "recv:bytes",
+        "preview": "[[\"EURCHF_otc\",1776888463.443,0.90115]]"
+      },
+      {
+        "ts": 1776881263.9427898,
+        "kind": "recv:str",
+        "preview": "451-[\"updateStream\",{\"_placeholder\":true,\"num\":0}]"
+      },
+      {
+        "ts": 1776881263.942988,
+        "kind": "recv:bytes",
+        "preview": "[[\"EURCHF_otc\",1776888463.943,0.90118]]"
+      },
+      {
+        "ts": 1776881264.112257,
+        "kind": "recv:str",
+        "preview": "451-[\"updateStream\",{\"_placeholder\":true,\"num\":0}]"
+      },
+      {
+        "ts": 1776881264.2186549,
+        "kind": "recv:bytes",
+        "preview": "[[\"EURCHF_otc\",1776888464.232,0.90118]]"
+      },
+      {
+        "ts": 1776881264.356813,
+        "kind": "recv:str",
+        "preview": "451-[\"updateStream\",{\"_placeholder\":true,\"num\":0}]"
+      },
+      {
+        "ts": 1776881264.481034,
+        "kind": "recv:bytes",
+        "preview": "[[\"EURCHF_otc\",1776888464.443,0.90123]]"
+      },
+      {
+        "ts": 1776881264.966648,
+        "kind": "recv:str",
+        "preview": "451-[\"updateStream\",{\"_placeholder\":true,\"num\":0}]"
+      },
+      {
+        "ts": 1776881264.966878,
+        "kind": "recv:bytes",
+        "preview": "[[\"EURCHF_otc\",1776888464.959,0.9012]]"
+      }
+    ]
+  },
+  "stream_ticks_seen": 1790,
+  "stream_closed_len": 14,
+  "active_mode": "STREAM",
+  "watchdog": {
+    "enabled": true,
+    "tick_max_age_sec": 8.0,
+    "fails_required": 3,
+    "cooldown_sec": 60.0,
+    "start_grace_sec": 360.0,
+    "bad_count": 0,
+    "last_restart_ts": null,
+    "last_reason": "ok"
+  }
+}
+
+===== SYMBOLS =====
+{
+  "ok": true,
+  "active_symbol": "EURCHF_otc",
+  "symbols": [
+    "AUDNZD_otc",
+    "CADCHF_otc",
+    "EURCHF_otc",
+    "CHFJPY_otc"
+  ],
+  "by_symbol_keys": [
+    "AUDNZD_otc",
+    "CADCHF_otc",
+    "EURCHF_otc",
+    "CHFJPY_otc"
+  ]
+}
+
+===== SYMBOLS DEBUG ALL =====
+{
+  "ok": true,
+  "active_symbol": "EURCHF_otc",
+  "items": [
+    {
+      "symbol": "AUDNZD_otc",
+      "is_active": false,
+      "exists": true,
+      "history_closed_len": 93,
+      "stream_closed_len": 4,
+      "has_stream_current": true,
+      "active_mode": "STREAM"
+    },
+    {
+      "symbol": "CADCHF_otc",
+      "is_active": false,
+      "exists": true,
+      "history_closed_len": 93,
+      "stream_closed_len": 8,
+      "has_stream_current": true,
+      "active_mode": "STREAM"
+    },
+    {
+      "symbol": "EURCHF_otc",
+      "is_active": true,
+      "exists": true,
+      "history_closed_len": 93,
+      "stream_closed_len": 14,
+      "has_stream_current": true,
+      "active_mode": "STREAM"
+    },
+    {
+      "symbol": "CHFJPY_otc",
+      "is_active": false,
+      "exists": true,
+      "history_closed_len": 93,
+      "stream_closed_len": 8,
+      "has_stream_current": true,
+      "active_mode": "STREAM"
+    }
+  ]
+}
+
+===== STRATEGY DEBUG ALL SYMBOLS =====
+{
+  "symbol": "AUDNZD_otc",
+  "is_active": false,
+  "active_mode": "STREAM",
+  "state": "CLEAN_BUY",
+  "market_state_main": "CLEAN_BUY",
+  "market_bias": "BUY",
+  "local_state": "WAIT_BUY",
+  "reason": "no_signal"
+}
+{
+  "symbol": "CADCHF_otc",
+  "is_active": false,
+  "active_mode": "STREAM",
+  "state": "CLEAN_SELL",
+  "market_state_main": "CLEAN_SELL",
+  "market_bias": "SELL",
+  "local_state": "WAIT_SELL",
+  "reason": "no_signal"
+}
+{
+  "symbol": "EURCHF_otc",
+  "is_active": true,
+  "active_mode": "STREAM",
+  "state": "CHAOS_NO_TRADE",
+  "market_state_main": "CHAOS",
+  "market_bias": "CHAOS",
+  "local_state": "NONE",
+  "reason": "main_chaos,market_bias_chaos_block"
+}
+{
+  "symbol": "CHFJPY_otc",
+  "is_active": false,
+  "active_mode": "STREAM",
+  "state": "CLEAN_BUY",
+  "market_state_main": "CLEAN_BUY",
+  "market_bias": "BUY",
+  "local_state": "WAIT_BUY",
+  "reason": "no_signal"
+}
+
+===== BEST SYMBOL CANDIDATE =====
+{
+  "ok": true,
+  "active_symbol": "EURCHF_otc",
+  "best": {
+    "symbol": "AUDNZD_otc",
+    "rank": 0,
+    "state": "CHAOS_NO_TRADE",
+    "trend_buy": false,
+    "trend_sell": false,
+    "chaos": true,
+    "prepare_buy": false,
+    "prepare_sell": false,
+    "final_buy": false,
+    "final_sell": false
+  },
+  "would_switch": false
+}
+
+===== SIGNAL SCAN =====
+{
+  "ok": true,
+  "active_symbol": "EURCHF_otc",
+  "count": 0,
+  "items": []
+}
+
+===== STATS =====
+{
+  "ok": true,
+  "signals_total": 4,
+  "trades_total": 3,
+  "signals": {
+    "new": 1,
+    "taken": 0,
+    "skipped": 0,
+    "win": 2,
+    "loss": 1
+  },
+  "results": {
+    "win": 2,
+    "loss": 1,
+    "decided": 3,
+    "winrate": 66.67
+  }
+}
+
+===== LAST SIGNAL =====
+{
+  "ok": true,
+  "item": {
+    "id": 4,
+    "signal_key": "EURCHF_otc:1776818100:SELL",
+    "symbol": "EURCHF_otc",
+    "timeframe": "M1",
+    "candle_ts": 1776818100,
+    "signal_time": "2026-04-22 00:39:50",
+    "side": "SELL",
+    "reason": "TEST_SIGNAL",
+    "status": "new",
+    "is_informational": 0,
+    "expires_at_ts": 1776818160,
+    "created_at": "2026-04-22 00:39:50",
+    "updated_at": "2026-04-22 00:39:50"
+  }
+}
+
+===== LAST 5 SIGNALS =====
+{
+  "ok": true,
+  "count": 4,
+  "items": [
+    {
+      "id": 4,
+      "signal_key": "EURCHF_otc:1776818100:SELL",
+      "symbol": "EURCHF_otc",
+      "timeframe": "M1",
+      "candle_ts": 1776818100,
+      "signal_time": "2026-04-22 00:39:50",
+      "side": "SELL",
+      "reason": "TEST_SIGNAL",
+      "status": "new",
+      "is_informational": 0,
+      "expires_at_ts": 1776818160,
+      "created_at": "2026-04-22 00:39:50",
+      "updated_at": "2026-04-22 00:39:50"
+    },
+    {
+      "id": 3,
+      "signal_key": "AUDNZD_otc:1776544080:SELL",
+      "symbol": "AUDNZD_otc",
+      "timeframe": "M1",
+      "candle_ts": 1776544080,
+      "signal_time": "2026-04-18 20:31:53",
+      "side": "SELL",
+      "reason": "TEST_SIGNAL",
+      "status": "win",
+      "is_informational": 0,
+      "expires_at_ts": 1776544140,
+      "created_at": "2026-04-18 20:31:53",
+      "updated_at": "2026-04-20 22:12:52"
+    },
+    {
+      "id": 2,
+      "signal_key": "CHFJPY_otc:1773356220:SELL",
+      "symbol": "CHFJPY_otc",
+      "timeframe": "M1",
+      "candle_ts": 1773356220,
+      "signal_time": "2026-03-12 22:58:06",
+      "side": "SELL",
+      "reason": "TEST_SIGNAL",
+      "status": "loss",
+      "is_informational": 0,
+      "expires_at_ts": 1773356280,
+      "created_at": "2026-03-12 22:58:06",
+      "updated_at": "2026-03-12 22:58:21"
+    },
+    {
+      "id": 1,
+      "signal_key": "CHFJPY_otc:1773355320:SELL",
+      "symbol": "CHFJPY_otc",
+      "timeframe": "M1",
+      "candle_ts": 1773355320,
+      "signal_time": "2026-03-12 22:48:13",
+      "side": "SELL",
+      "reason": "TEST_SIGNAL",
+      "status": "win",
+      "is_informational": 0,
+      "expires_at_ts": 1773355380,
+      "created_at": "2026-03-12 22:48:13",
+      "updated_at": "2026-03-12 22:55:53"
+    }
+  ]
+}
+
+===== LAST 10 CLOSED CANDLES =====
+{
+  "ok": true,
+  "count": 10,
+  "active_mode": "STREAM",
+  "store": "ss.stream_closed",
+  "items": [
+    {
+      "timestamp": 1776880620,
+      "open_time": "2026-04-22 19:57:00",
+      "ha_dir": "UP",
+      "ha_open": 0.9007775,
+      "ha_high": 0.90245,
+      "ha_low": 0.90074,
+      "ha_close": 0.9016525
+    },
+    {
+      "timestamp": 1776880680,
+      "open_time": "2026-04-22 19:58:00",
+      "ha_dir": "UP",
+      "ha_open": 0.901215,
+      "ha_high": 0.90239,
+      "ha_low": 0.90105,
+      "ha_close": 0.9017075
+    },
+    {
+      "timestamp": 1776880740,
+      "open_time": "2026-04-22 19:59:00",
+      "ha_dir": "DOWN",
+      "ha_open": 0.90146125,
+      "ha_high": 0.90146125,
+      "ha_low": 0.90073,
+      "ha_close": 0.9011125000000001
+    },
+    {
+      "timestamp": 1776880800,
+      "open_time": "2026-04-22 20:00:00",
+      "ha_dir": "UP",
+      "ha_open": 0.901286875,
+      "ha_high": 0.90226,
+      "ha_low": 0.90104,
+      "ha_close": 0.9015925
+    },
+    {
+      "timestamp": 1776880860,
+      "open_time": "2026-04-22 20:01:00",
+      "ha_dir": "UP",
+      "ha_open": 0.9014396875,
+      "ha_high": 0.90215,
+      "ha_low": 0.90141,
+      "ha_close": 0.9017725
+    },
+    {
+      "timestamp": 1776880920,
+      "open_time": "2026-04-22 20:02:00",
+      "ha_dir": "UP",
+      "ha_open": 0.90160609375,
+      "ha_high": 0.90198,
+      "ha_low": 0.90119,
+      "ha_close": 0.901715
+    },
+    {
+      "timestamp": 1776880980,
+      "open_time": "2026-04-22 20:03:00",
+      "ha_dir": "UP",
+      "ha_open": 0.9016605468750001,
+      "ha_high": 0.90202,
+      "ha_low": 0.90114,
+      "ha_close": 0.9016675000000001
+    },
+    {
+      "timestamp": 1776881040,
+      "open_time": "2026-04-22 20:04:00",
+      "ha_dir": "UP",
+      "ha_open": 0.9016640234375001,
+      "ha_high": 0.90233,
+      "ha_low": 0.90142,
+      "ha_close": 0.9019
+    },
+    {
+      "timestamp": 1776881100,
+      "open_time": "2026-04-22 20:05:00",
+      "ha_dir": "UP",
+      "ha_open": 0.90178201171875,
+      "ha_high": 0.9028,
+      "ha_low": 0.90178201171875,
+      "ha_close": 0.90222
+    },
+    {
+      "timestamp": 1776881160,
+      "open_time": "2026-04-22 20:06:00",
+      "ha_dir": "DOWN",
+      "ha_open": 0.902001005859375,
+      "ha_high": 0.90241,
+      "ha_low": 0.90154,
+      "ha_close": 0.9019375000000001
+    }
+  ]
+}
+
+===== DB STATUS =====
+{
+  "ok": true,
+  "db_path": "data/bot.db",
+  "exists": true,
+  "size": 40960,
+  "tables": [
+    "app_state",
+    "signals",
+    "sqlite_sequence",
+    "trades"
+  ]
+}
+
+===== SQLITE APP_STATE =====
+

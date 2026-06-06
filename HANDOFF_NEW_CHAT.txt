@@ -1,0 +1,120 @@
+PROJECT HANDOFF — bot-srdce
+
+ZÁKLAD
+- Projekt: PocketOption trading bot
+- Cesta: ~/bot-srdce
+- Platforma: macOS
+- Nechci nic přepisovat od nuly.
+- Chci jen malé chirurgické patche.
+- Nejdřív vždy zjistit aktuální stav přes grep/sed/curl, pak teprve patch.
+- Po každé změně ověřit syntaxi přes py_compile.
+
+CO TVOŘÍME
+- Multi-worker stack pro více symbolů
+- Koordinátor s jednoduchými stavy
+- Telegram jako hlavní ovládání
+- Dashboard jako přehled
+- Nakonec doladěná strategie
+
+AKTUÁLNÍ SYMBOLY / STACK
+- AUDNZD_otc
+- EURCHF_otc
+- CHFJPY_otc
+
+HLAVNÍ ČÁSTI
+- app/main.py
+- dual_stream_test.py
+- stream_coordinator_test.py
+- run_stack_watchdog.py
+- start_main_tg.sh
+- .env.telegram (NEPOSÍLAT, TAJNÉ)
+
+JAK MÁ PROJEKT FUNGOVAT
+- Používáme Heikin Ashi
+- Market bias přes okna 8 / 12 / 16
+- Bias dává BUY / SELL / CHAOS
+- 2 křížky jsou důležité a mají zůstat
+- 3 křížky v řadě = ZRUŠENO
+- FINAL až po reakční svíčce
+- Povrchové stavy mají být jednoduché:
+  - NIC
+  - POZOR BUY
+  - POZOR SELL
+  - VSTUP BUY
+  - VSTUP SELL
+  - ZRUŠENO
+
+CO UŽ FUNGUJE
+- Multi-worker stack běží
+- Koordinátor běží
+- Watchdog běží
+- Telegram funguje
+- Telegram menu funguje
+- Telegram simple scan funguje
+- Telegram status funguje
+- Dashboard header byl předělán na nový stack
+- Přehled symbolů byl předělán na nový koordinátor
+- Dashboard už znovu běží po opravě JS chyby
+- Telegram je uložen přes .env.telegram + start_main_tg.sh
+
+CO JE TEĎ HLAVNÍ ÚKOL
+1. Dodělat dashboard finálně
+2. Opravit:
+   - HA graf
+   - Posledních 10 uzavřených svíček
+3. Napojit obě části na nový stack / aktivního workera, ne na starou logiku
+4. Potom ladit strategii
+
+DŮLEŽITÝ STYL PRÁCE
+- Nepřepisovat od nuly
+- Nedělat 3 varianty řešení
+- Udělat 1 nejlepší malý bezpečný patch
+- Když něco není jisté, nejdřív si vyžádat výpisy
+- Po patchi vždy:
+  - python3 -m py_compile app/main.py
+  - curl testy
+  - přesné restart kroky
+
+JAK TO SPOUŠTÍME
+
+WATCHDOG
+cd ~/bot-srdce
+source .venv/bin/activate
+python3 run_stack_watchdog.py
+
+HLAVNÍ API + TELEGRAM
+cd ~/bot-srdce
+./start_main_tg.sh
+
+DASHBOARD
+http://127.0.0.1:8000/dashboard
+
+KOORDINÁTOR
+http://127.0.0.1:8020/api/coord/simple_state
+http://127.0.0.1:8020/api/coord/market_state
+
+KONTROLNÍ PŘÍKAZY
+
+SYNTAXE
+python3 -m py_compile app/main.py
+python3 -m py_compile dual_stream_test.py
+python3 -m py_compile stream_coordinator_test.py
+python3 -m py_compile run_stack_watchdog.py
+
+TELEGRAM
+curl -sS http://127.0.0.1:8000/api/telegram/status | jq
+
+DASHBOARD
+curl -sS http://127.0.0.1:8000/api/dashboard/stack_status | jq
+curl -sS http://127.0.0.1:8000/api/dashboard/simple_scan | jq
+
+KOORDINÁTOR
+curl -sS http://127.0.0.1:8020/api/coord/simple_state | jq
+curl -sS http://127.0.0.1:8020/api/coord/market_state | jq
+
+PRVNÍ ÚKOL PRO NOVÝ CHAT
+- Nejdřív zjisti aktuální stav dashboardu pro:
+  - HA graf
+  - Posledních 10 uzavřených svíček
+- Vytáhni přesné části app/main.py přes grep/sed/curl
+- Pak navrhni 1 malý bezpečný patch

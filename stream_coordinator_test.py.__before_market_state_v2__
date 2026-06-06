@@ -1,0 +1,157 @@
+from fastapi import FastAPI
+import uvicorn
+import urllib.request
+import json
+import time
+from typing import Any, Dict, List
+
+APP = FastAPI(title="stream-coordinator-test")
+
+WORKERS = [
+    {"symbol": "AUDNZD_otc", "url": "http://127.0.0.1:8011/status"},
+    {"symbol": "EURCHF_otc", "url": "http://127.0.0.1:8013/status"},
+    {"symbol": "CHFJPY_otc", "url": "http://127.0.0.1:8014/status"},
+]
+
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+def _market_state_from_worker_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    if not item.get("worker_ok"):
+        return {
+            "symbol": item.get("symbol"),
+            "state": "CHAOS",
+            "reason": "worker_not_ok",
+        }
+
+    active_mode = str(item.get("active_mode") or "")
+    stream_closed_len = int(item.get("stream_closed_len") or 0)
+    last_closed = item.get("last_closed") or {}
+    current = item.get("current") or {}
+
+    if active_mode != "STREAM":
+        return {
+            "symbol": item.get("symbol"),
+            "state": "CHAOS",
+            "reason": "not_in_stream",
+        }
+
+    if stream_closed_len < 2:
+        return {
+            "symbol": item.get("symbol"),
+            "state": "CHAOS",
+            "reason": "not_enough_closed_stream_candles",
+        }
+
+    cur_open = _safe_float(current.get("open"))
+    cur_close = _safe_float(current.get("close"))
+    cur_high = _safe_float(current.get("high"))
+    cur_low = _safe_float(current.get("low"))
+
+    last_open = _safe_float(last_closed.get("open"))
+    last_close = _safe_float(last_closed.get("close"))
+    last_high = _safe_float(last_closed.get("high"))
+    last_low = _safe_float(last_closed.get("low"))
+
+    cur_dir = "BUY" if cur_close >= cur_open else "SELL"
+    last_dir = "BUY" if last_close >= last_open else "SELL"
+
+    cur_body = abs(cur_close - cur_open)
+    cur_range = abs(cur_high - cur_low)
+    last_body = abs(last_close - last_open)
+    last_range = abs(last_high - last_low)
+
+    cur_body_ratio = (cur_body / cur_range) if cur_range > 0 else 0.0
+    last_body_ratio = (last_body / last_range) if last_range > 0 else 0.0
+
+    if cur_dir == last_dir and cur_body_ratio >= 0.35 and last_body_ratio >= 0.35:
+        return {
+            "symbol": item.get("symbol"),
+            "state": cur_dir,
+            "reason": f"same_dir_current_and_last_closed body_ratio=({cur_body_ratio:.2f},{last_body_ratio:.2f})",
+        }
+
+    return {
+        "symbol": item.get("symbol"),
+        "state": "CHAOS",
+        "reason": f"mixed_or_weak current={cur_dir} last={last_dir} body_ratio=({cur_body_ratio:.2f},{last_body_ratio:.2f})",
+    }
+
+def fetch_json(url: str):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        return json.loads(raw)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+@APP.get("/status")
+def status():
+    items = []
+    now = time.time()
+
+    for w in WORKERS:
+        data = fetch_json(w["url"])
+        item = {
+            "symbol": w["symbol"],
+            "worker_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
+            "worker_url": w["url"],
+            "fetched_at": now,
+        }
+
+        if isinstance(data, dict) and data.get("ok"):
+            item.update({
+                "active_mode": data.get("active_mode"),
+                "stream_closed_len": data.get("stream_closed_len"),
+                "has_stream_current": data.get("has_stream_current"),
+                "tick_feed": data.get("tick_feed"),
+                "last_closed": data.get("last_closed"),
+                "current": data.get("current"),
+            })
+        else:
+            item["error"] = data.get("error", "worker_unavailable") if isinstance(data, dict) else "invalid_worker_response"
+
+        items.append(item)
+
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
+
+@APP.get("/api/coord/status")
+def coord_status():
+    raw = status()
+    simple = []
+    for item in raw["items"]:
+        simple.append({
+            "symbol": item["symbol"],
+            "worker_ok": item.get("worker_ok"),
+            "active_mode": item.get("active_mode"),
+            "stream_closed_len": item.get("stream_closed_len"),
+            "has_stream_current": item.get("has_stream_current"),
+        })
+    return {
+        "ok": True,
+        "items": simple,
+    }
+
+@APP.get("/api/coord/market_state")
+def coord_market_state():
+    raw = status()
+    items: List[Dict[str, Any]] = []
+    for item in raw["items"]:
+        items.append(_market_state_from_worker_item(item))
+    return {
+        "ok": True,
+        "items": items,
+    }
+
+def main():
+    uvicorn.run(APP, host="127.0.0.1", port=8020, log_level="info")
+
+if __name__ == "__main__":
+    main()

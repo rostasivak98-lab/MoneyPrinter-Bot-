@@ -1,0 +1,5862 @@
+import os
+import time
+import json
+import asyncio
+import inspect
+import datetime
+import logging
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Any, Tuple, Set
+from functools import wraps
+
+from fastapi import FastAPI, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+
+from pocketoptionapi_async import AsyncPocketOptionClient
+from playwright.async_api import async_playwright
+
+logging.getLogger("pocketoptionapi_async").setLevel(logging.ERROR)
+logging.getLogger("websockets").setLevel(logging.ERROR)
+logging.getLogger("playwright").setLevel(logging.ERROR)
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+APP_NAME = "New Chance"
+
+TF_SEC = int(os.getenv("PO_TF_SEC", "60"))
+SYMBOL_DEFAULT = os.getenv("PO_SYMBOL", "CHFJPY_otc")
+IS_DEMO = os.getenv("PO_IS_DEMO", "1").strip() in ("1", "true", "True", "yes", "YES")
+LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Prague")
+SSID_FILE = os.getenv("PO_SSID_FILE", "po_ssid.txt")
+
+FRESH_MAX_SEC = int(os.getenv("PO_FRESH_MAX_SEC", "120"))
+PO_TIME_OFFSET_SEC = int(os.getenv("PO_TIME_OFFSET_SEC", "7200"))
+
+PO_USE_PW = os.getenv("PO_USE_PLAYWRIGHT", "1").strip() in ("1", "true", "True", "yes", "YES")
+PO_PW_HEADLESS = os.getenv("PO_PW_HEADLESS", "0").strip() in ("1", "true", "True", "yes", "YES")
+PO_PW_URL = os.getenv("PO_PW_URL", "https://pocketoption.com/en/cabinet/demo-quick-high-low/").strip()
+PO_PW_PROFILE_DIR = os.path.expanduser(os.getenv("PO_PW_PROFILE_DIR", "~/.newchance_pw_profile"))
+PO_PW_BROWSER = os.getenv("PO_PW_BROWSER", "webkit").strip().lower()  # chromium | webkit
+
+# Warmup
+WARMUP_GRACE_SEC = float(os.getenv("PO_WARMUP_GRACE_SEC", "2"))
+
+# HA seed
+HA_SEED_FILE = os.getenv("PO_HA_SEED_FILE", "ha_seed.json")
+
+# WATCHDOG (AUTO, with start-grace)
+WD_ENABLED = os.getenv("PO_WD_ENABLED", "1").strip() in ("1", "true", "True", "yes", "YES")
+WD_TICK_MAX_AGE_SEC = float(os.getenv("PO_WD_TICK_MAX_AGE_SEC", "8"))
+WD_FAILS_REQUIRED = int(os.getenv("PO_WD_FAILS_REQUIRED", "3"))
+WD_COOLDOWN_SEC = float(os.getenv("PO_WD_COOLDOWN_SEC", "60"))
+WD_START_GRACE_SEC = float(os.getenv("PO_WD_START_GRACE_SEC", "360"))  # ignore no_ticks_yet this long after engine start
+
+print(f"LOADED New Chance main.py WATCHDOG+GRACE ✅ browser={PO_PW_BROWSER} symbol={SYMBOL_DEFAULT}")
+
+
+def _now_ts() -> int:
+    return int(time.time())
+
+
+def _align(ts: int) -> int:
+    return ts - (ts % TF_SEC)
+
+
+def _fmt(ts_epoch: int) -> str:
+    try:
+        if ZoneInfo:
+            dt = datetime.datetime.fromtimestamp(ts_epoch, tz=ZoneInfo(LOCAL_TZ))
+        else:
+            dt = datetime.datetime.fromtimestamp(ts_epoch)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ts_epoch)
+
+
+def _open_close_str(ts_open: int) -> Tuple[str, str]:
+    return _fmt(ts_open), _fmt(ts_open + TF_SEC)
+
+
+def _age_sec(ts_open: int) -> int:
+    close_ts = ts_open + TF_SEC
+    age = _now_ts() - close_ts
+    return 0 if age < 0 else int(age)
+
+
+def _read_ssid() -> Optional[str]:
+    ssid_env = os.getenv("PO_SSID")
+    if ssid_env and ssid_env.strip():
+        return ssid_env.strip()
+    try:
+        with open(SSID_FILE, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    return ln
+        return None
+    except Exception:
+        return None
+
+
+def _norm(s: str) -> str:
+    s = (s or "").lower()
+    out = []
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+    return "".join(out)
+
+
+@dataclass
+class StreamStats:
+    ticks_seen: int = 0
+    last_tick_local: Optional[float] = None
+    last_tick_ts_raw: Optional[float] = None
+    last_tick_ts_used: Optional[float] = None
+    last_tick_price: Optional[float] = None
+
+
+@dataclass
+class TickFeedStats:
+    enabled: bool = PO_USE_PW
+    running: bool = False
+    last_err: str = "—"
+    url: str = PO_PW_URL
+    headless: bool = PO_PW_HEADLESS
+    profile_dir: str = PO_PW_PROFILE_DIR
+    browser: str = PO_PW_BROWSER
+
+    ws_seen: int = 0
+    frames_seen: int = 0
+    frames_last_ts: Optional[float] = None
+
+    pending_event: Optional[str] = None
+    pending_ts: Optional[float] = None
+
+    asset_id_for_symbol: Optional[int] = None
+    asset_map_size: int = 0
+
+    last_tick_event: Optional[str] = None
+    tick_time_mode: str = "unknown"
+
+    ticks_seen: int = 0
+    last_price: Optional[float] = None
+    last_tick_ts_raw: Optional[float] = None
+    last_tick_ts_used: Optional[float] = None
+    last_tick_local_ts: Optional[float] = None
+    last_tick_age_sec: Optional[float] = None
+
+    warmup_active: bool = False
+    warmup_until_open_ts: Optional[int] = None
+    warmup_note: str = "—"
+
+    frames_tail: List[Dict[str, Any]] = None
+
+
+MULTI_SYMBOLS = [
+    "AUDNZD_otc",
+    "CADCHF_otc",
+    "EURCHF_otc",
+    "CHFJPY_otc",
+]
+
+
+@dataclass
+class SymbolState:
+    history_closed: List[Dict[str, Any]] = None
+    stream_current: Optional[Dict[str, Any]] = None
+    stream_closed: List[Dict[str, Any]] = None
+    stream: StreamStats = None
+    active_mode: str = "HISTORY"
+    history_age_sec: Optional[int] = None
+    stream_age_sec: Optional[int] = None
+
+
+@dataclass
+class State:
+    running: bool = False
+    connected: bool = False
+    symbol: str = SYMBOL_DEFAULT
+    switch_mode: str = "MANUAL"
+    symbols: List[str] = None
+    by_symbol: Dict[str, SymbolState] = None
+    is_demo: bool = IS_DEMO
+    tf_sec: int = TF_SEC
+    local_tz: str = LOCAL_TZ
+    fresh_max_sec: int = FRESH_MAX_SEC
+    po_time_offset_sec: int = PO_TIME_OFFSET_SEC
+
+    last_connect_error: str = "—"
+    last_candles_error: str = "—"
+    last_fetch_count: int = 0
+    last_poll_ts: Optional[float] = None
+
+    history_closed: List[Dict[str, Any]] = None
+
+    stream_current: Optional[Dict[str, Any]] = None
+    stream_closed: List[Dict[str, Any]] = None
+    stream: StreamStats = None
+
+    active_mode: str = "HISTORY"
+    history_age_sec: Optional[int] = None
+    stream_age_sec: Optional[int] = None
+
+    tick_feed: TickFeedStats = None
+
+    # watchdog telemetry
+    wd_enabled: bool = WD_ENABLED
+    wd_tick_max_age_sec: float = WD_TICK_MAX_AGE_SEC
+    wd_fails_required: int = WD_FAILS_REQUIRED
+    wd_cooldown_sec: float = WD_COOLDOWN_SEC
+    wd_start_grace_sec: float = WD_START_GRACE_SEC
+
+    wd_bad_count: int = 0
+    wd_last_restart_ts: Optional[float] = None
+    wd_last_reason: str = "—"
+    wd_engine_start_ts: Optional[float] = None
+
+
+app = FastAPI(title=APP_NAME)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+STATE = State(
+    symbols=list(MULTI_SYMBOLS),
+    by_symbol={
+        sym: SymbolState(
+            history_closed=[],
+            stream_current=None,
+            stream_closed=[],
+            stream=StreamStats(),
+            active_mode="HISTORY",
+            history_age_sec=None,
+            stream_age_sec=None,
+        )
+        for sym in MULTI_SYMBOLS
+    },
+    history_closed=[],
+    stream_current=None,
+    stream_closed=[],
+    stream=StreamStats(),
+    tick_feed=TickFeedStats(frames_tail=[]),
+)
+
+_engine_task: Optional[asyncio.Task] = None
+_tick_task: Optional[asyncio.Task] = None
+_stop_event = asyncio.Event()
+_lock = asyncio.Lock()
+_TICK_FEED_RUN_ID = 0
+_PW_CTX = None
+_PW_PAGE = None
+
+_ASSET_ID_TO_SYMBOL: Dict[int, str] = {}
+_SEEN_SYMBOLS: Set[str] = set()
+
+_HA_SEEDS: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_symbol_state(symbol: Optional[str] = None) -> SymbolState:
+    sym = symbol or STATE.symbol
+    by_symbol = getattr(STATE, "by_symbol", None) or {}
+    ss = by_symbol.get(sym)
+    if ss is None:
+        ss = SymbolState(
+            history_closed=[],
+            stream_current=None,
+            stream_closed=[],
+            stream=StreamStats(),
+            active_mode="HISTORY",
+            history_age_sec=None,
+            stream_age_sec=None,
+        )
+        by_symbol[sym] = ss
+        STATE.by_symbol = by_symbol
+    if ss.history_closed is None:
+        ss.history_closed = []
+    if ss.stream_closed is None:
+        ss.stream_closed = []
+    if ss.stream is None:
+        ss.stream = StreamStats()
+    return ss
+
+
+def _get_history_closed(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    return _get_symbol_state(symbol).history_closed or []
+
+
+def _get_stream_closed(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    return _get_symbol_state(symbol).stream_closed or []
+
+
+def _get_stream_current(symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    return _get_symbol_state(symbol).stream_current
+
+
+def _load_ha_seeds() -> None:
+    global _HA_SEEDS
+    try:
+        if not os.path.exists(HA_SEED_FILE):
+            _HA_SEEDS = {}
+            return
+        with open(HA_SEED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _HA_SEEDS = data if isinstance(data, dict) else {}
+    except Exception:
+        _HA_SEEDS = {}
+
+
+def _save_ha_seeds() -> None:
+    try:
+        with open(HA_SEED_FILE, "w", encoding="utf-8") as f:
+            json.dump(_HA_SEEDS, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# --- AUTOSAVE HA SEED (fresh) -----------------------------------------------
+
+from typing import Optional
+import sqlite3
+from pathlib import Path
+from fastapi.responses import HTMLResponse, RedirectResponse
+import urllib.request
+import urllib.parse
+import ssl
+import threading
+_LAST_AUTOSAVED_SEED_TS: Optional[int] = None
+
+def _autosave_ha_seed_from_last_closed(reason: str = "autosave") -> bool:
+    """Persist a fresh HA seed based on a closed candle.
+
+    IMPORTANT:
+    - For minute_close, do NOT persist the just-closed candle as seed.
+      That would make the current candle self-seeded on /api/last.
+    - Instead, persist the PREVIOUS closed candle, so the newest candle
+      is always chained from prev_ha like Pocket does.
+    """
+    global _LAST_AUTOSAVED_SEED_TS
+
+    closed = STATE.stream_closed if getattr(STATE, "active_mode", None) == "STREAM" else STATE.history_closed
+    if not closed:
+        return False
+
+    candidates = list(closed)
+
+    # Fix self-seed:
+    # after appending a newly closed candle, seed the PREVIOUS one
+    # so the latest candle is derived from prev_ha, not from itself.
+    if reason == "minute_close":
+        if len(candidates) < 2:
+            return False
+        candidates = candidates[:-1]
+
+    # pick last minute-aligned closed candle from candidates
+    last = None
+    for _c in reversed(candidates):
+        try:
+            _ts = int((_c.get("timestamp") if isinstance(_c, dict) else getattr(_c, "timestamp", 0)) or 0)
+        except Exception:
+            _ts = 0
+        if _ts > 0 and (_ts % 60) == 0:
+            last = _c
+            break
+
+    if last is None:
+        last = candidates[-1]
+
+    try:
+        last_with_ha = _attach_ha(dict(last))
+    except Exception:
+        return False
+
+    ts = int(last_with_ha.get("timestamp") or 0)
+    ha_open = last_with_ha.get("ha_open")
+    ha_close = last_with_ha.get("ha_close")
+
+    if ts <= 0 or ha_open is None or ha_close is None:
+        return False
+
+    if _LAST_AUTOSAVED_SEED_TS == ts:
+        return False
+
+    sym = getattr(STATE, "symbol", None) or last_with_ha.get("symbol")
+    if not sym:
+        return False
+
+    _HA_SEEDS[sym] = {
+        "timestamp": ts,
+        "ha_open": float(ha_open),
+        "ha_close": float(ha_close),
+        "updated_at": time.time(),
+        "reason": reason,
+    }
+    _save_ha_seeds()
+    _LAST_AUTOSAVED_SEED_TS = ts
+    return True
+_load_ha_seeds()
+
+
+def _get_seed_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    s = _HA_SEEDS.get(symbol)
+    return s if isinstance(s, dict) else None
+
+
+def _history_limit_from_seed(default: int = 120, maximum: int = 1500) -> int:
+    seed = _get_seed_for_symbol(STATE.symbol)
+    if not isinstance(seed, dict):
+        return default
+    try:
+        seed_ts = int(seed.get("timestamp") or 0)
+    except Exception:
+        return default
+    if seed_ts <= 0:
+        return default
+    age_sec = max(0, int(time.time()) - seed_ts)
+    need = int(age_sec // 60) + 20
+    if need < default:
+        return default
+    if need > maximum:
+        return maximum
+    return need
+
+
+def _pick_last_history(symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    ss = _get_symbol_state(symbol)
+    return ss.history_closed[-1] if ss.history_closed else None
+
+
+def _pick_last_stream_closed(symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    ss = _get_symbol_state(symbol)
+    return ss.stream_closed[-1] if ss.stream_closed else None
+
+
+def _update_hybrid_choice() -> None:
+    ss = _get_symbol_state()
+    h = _pick_last_history()
+    s = _pick_last_stream_closed()
+    ss.history_age_sec = _age_sec(int(h["timestamp"])) if h else None
+    ss.stream_age_sec = _age_sec(int(s["timestamp"])) if s else None
+
+    tf = STATE.tick_feed
+    tick_fresh = (tf.last_tick_local_ts is not None) and ((time.time() - tf.last_tick_local_ts) <= 3.0)
+    stream_ready = s is not None and len(_get_stream_closed()) >= 2
+
+    # IMPORTANT:
+    # After restart, first closed STREAM candle acts as bridge for HA chaining.
+    # Switch output to STREAM only when we have at least 2 closed STREAM candles.
+    if tick_fresh and stream_ready:
+        ss.active_mode = "STREAM"
+        STATE.active_mode = ss.active_mode
+        STATE.history_age_sec = ss.history_age_sec
+        STATE.stream_age_sec = ss.stream_age_sec
+        return
+
+    if ss.history_age_sec is not None and ss.history_age_sec <= STATE.fresh_max_sec:
+        ss.active_mode = "HISTORY"
+    else:
+        ss.active_mode = "STREAM" if stream_ready else "HISTORY"
+
+    STATE.active_mode = ss.active_mode
+    STATE.history_age_sec = ss.history_age_sec
+    STATE.stream_age_sec = ss.stream_age_sec
+
+
+def _active_last_closed() -> Optional[Dict[str, Any]]:
+    if STATE.active_mode == "STREAM":
+        return _pick_last_stream_closed() or _pick_last_history()
+    return _pick_last_history() or _pick_last_stream_closed()
+
+
+def _append_stream_closed(c: Dict[str, Any], symbol: Optional[str] = None) -> None:
+    ss = _get_symbol_state(symbol)
+    lst = list(ss.stream_closed or [])
+
+    if not isinstance(c, dict):
+        return
+
+    try:
+        new_ts = int(c.get("timestamp"))
+    except Exception:
+        return
+
+    new_src = str(c.get("source") or "").upper()
+    replaced = False
+
+    for i, old in enumerate(lst):
+        if not isinstance(old, dict):
+            continue
+        try:
+            old_ts = int(old.get("timestamp"))
+        except Exception:
+            continue
+
+        if old_ts != new_ts:
+            continue
+
+        old_src = str(old.get("source") or "").upper()
+
+        if old_src == "STREAM_GAP_FILL" and new_src == "STREAM":
+            lst[i] = c
+
+        replaced = True
+        break
+
+    if not replaced:
+        lst.append(c)
+
+    lst.sort(key=lambda x: int(x.get("timestamp", 0)) if isinstance(x, dict) else 0)
+
+    if len(lst) > 500:
+        lst = lst[-500:]
+
+    ss.stream_closed = lst
+
+
+def _calibrate_tick_ts(ts_raw: float) -> Tuple[float, str]:
+    now = time.time()
+    diff = ts_raw - now
+    if abs(diff - float(STATE.po_time_offset_sec)) <= 600:
+        return (ts_raw - float(STATE.po_time_offset_sec), "minus_offset")
+    if abs(diff) <= 600:
+        return (ts_raw, "raw")
+    return (ts_raw, "unknown")
+
+
+def _ts_open_from_tick(ts_used: float) -> int:
+    return _align(int(ts_used))
+
+
+def _maybe_init_warmup(ts_used: float) -> None:
+    tf = STATE.tick_feed
+    if tf.warmup_until_open_ts is not None:
+        return
+
+    ts_open = _ts_open_from_tick(ts_used)
+    sec_into_minute = float(ts_used) - float(ts_open)
+
+    if sec_into_minute <= WARMUP_GRACE_SEC:
+        tf.warmup_active = False
+        tf.warmup_until_open_ts = ts_open
+        tf.warmup_note = f"disabled (start at +{sec_into_minute:.2f}s)"
+        return
+
+    tf.warmup_active = True
+    tf.warmup_until_open_ts = ts_open + TF_SEC
+    tf.warmup_note = f"active until {_fmt(tf.warmup_until_open_ts)} (start at +{sec_into_minute:.2f}s)"
+
+
+def _start_new_stream_candle(ts_open: int, price: float, symbol: Optional[str] = None) -> None:
+    sym = symbol or STATE.symbol
+    ss = _get_symbol_state(sym)
+    ss.stream_current = {
+        "symbol": sym,
+        "timestamp": ts_open,
+        "open": float(price),
+        "high": float(price),
+        "low": float(price),
+        "close": float(price),
+        "volume": 1.0,
+        "source": "STREAM_FORMING",
+        "open_time": _open_close_str(ts_open)[0],
+        "close_time": _open_close_str(ts_open)[1],
+    }
+
+
+def _on_tick_for_symbol(symbol: str, ts_raw: float, price: float, event_name: Optional[str] = None) -> None:
+    sym = symbol
+    ts_used, mode = _calibrate_tick_ts(float(ts_raw))
+    tf = STATE.tick_feed
+    if sym == STATE.symbol:
+        _maybe_init_warmup(ts_used)
+
+        STATE.stream.ticks_seen += 1
+        STATE.stream.last_tick_local = time.time()
+        STATE.stream.last_tick_ts_raw = float(ts_raw)
+        STATE.stream.last_tick_ts_used = float(ts_used)
+        STATE.stream.last_tick_price = float(price)
+
+        tf.ticks_seen += 1
+        tf.last_price = float(price)
+        tf.last_tick_ts_raw = float(ts_raw)
+        tf.last_tick_ts_used = float(ts_used)
+        tf.last_tick_local_ts = time.time()
+        tf.last_tick_age_sec = 0.0
+        tf.last_tick_event = event_name or tf.last_tick_event
+        tf.tick_time_mode = mode
+
+    ts_open = _ts_open_from_tick(ts_used)
+    ss = _get_symbol_state(sym)
+    cur = ss.stream_current
+
+    if tf.warmup_active and tf.warmup_until_open_ts is not None:
+        if ts_open < tf.warmup_until_open_ts:
+            if cur is None or int(cur["timestamp"]) != ts_open:
+                _start_new_stream_candle(ts_open, price, symbol=symbol)
+            else:
+                cur["high"] = max(cur["high"], float(price))
+                cur["low"] = min(cur["low"], float(price))
+                cur["close"] = float(price)
+                cur["volume"] = float(cur.get("volume", 0.0) + 1.0)
+                ss.stream_current = cur
+            return
+
+        if ts_open == tf.warmup_until_open_ts:
+            tf.warmup_active = False
+            tf.warmup_note = f"done at {_fmt(ts_open)}"
+            _start_new_stream_candle(ts_open, price, symbol=symbol)
+            # warmup_done autosave disabled; keep last persisted minute_close seed
+            return
+
+        tf.warmup_active = False
+        tf.warmup_note = f"forced-off at {_fmt(ts_open)}"
+
+    if cur and int(cur["timestamp"]) == ts_open:
+        cur["high"] = max(cur["high"], float(price))
+        cur["low"] = min(cur["low"], float(price))
+        cur["close"] = float(price)
+        cur["volume"] = float(cur.get("volume", 0.0) + 1.0)
+        ss.stream_current = cur
+        return
+
+    if cur and cur.get("timestamp") is not None:
+        prev_ts = int(cur["timestamp"])
+        o, c = _open_close_str(prev_ts)
+        closed = {
+            "symbol": sym,
+            "timestamp": prev_ts,
+            "open": float(cur["open"]),
+            "high": float(cur["high"]),
+            "low": float(cur["low"]),
+            "close": float(cur["close"]),
+            "volume": float(cur.get("volume", 0.0)),
+            "source": "STREAM",
+            "open_time": o,
+            "close_time": c,
+            "age_sec": _age_sec(prev_ts),
+        }
+        _append_stream_closed(closed, symbol=symbol)
+        _autosave_ha_seed_from_last_closed(reason="minute_close")
+
+        last_close = float(cur["close"])
+        gap_ts = prev_ts + 60
+        while gap_ts < ts_open:
+            go, gc = _open_close_str(gap_ts)
+            gap_closed = {
+                "symbol": sym,
+                "timestamp": gap_ts,
+                "open": last_close,
+                "high": last_close,
+                "low": last_close,
+                "close": last_close,
+                "volume": 0.0,
+                "source": "STREAM_GAP_FILL",
+                "open_time": go,
+                "close_time": gc,
+                "age_sec": _age_sec(gap_ts),
+            }
+            _append_stream_closed(gap_closed, symbol=symbol)
+            _autosave_ha_seed_from_last_closed(reason="minute_close")
+            gap_ts += 60
+
+    _start_new_stream_candle(ts_open, price, symbol=symbol)
+
+
+def _parse_json_from_anyframe(s: str) -> Optional[Any]:
+    if not s:
+        return None
+    i = s.find("[")
+    j = s.find("{")
+    if i == -1 and j == -1:
+        return None
+    start = min([x for x in (i, j) if x != -1])
+    end = max(s.rfind("]"), s.rfind("}"))
+    if end == -1 or end <= start:
+        return None
+    raw = s[start:end + 1]
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _extract_socketio_event_name_if_placeholder(s: str) -> Optional[str]:
+    if not s or '"_placeholder"' not in s:
+        return None
+    k = s.find('["')
+    if k == -1:
+        return None
+    k += 2
+    m = s.find('"', k)
+    if m == -1:
+        return None
+    return s[k:m]
+
+
+def _maybe_ingest_assets(event_name: Optional[str], payload: Any) -> None:
+    if event_name != "updateAssets":
+        return
+    if not isinstance(payload, list):
+        return
+    for it in payload:
+        if not (isinstance(it, list) and len(it) >= 2):
+            continue
+        try:
+            aid = int(it[0])
+        except Exception:
+            continue
+        cand = it[1] if isinstance(it[1], str) else None
+        if not cand and len(it) >= 3 and isinstance(it[2], str):
+            cand = it[2]
+        if cand:
+            _ASSET_ID_TO_SYMBOL[aid] = cand
+
+    STATE.tick_feed.asset_map_size = len(_ASSET_ID_TO_SYMBOL)
+
+    target_norm = _norm(STATE.symbol)
+    if STATE.tick_feed.asset_id_for_symbol is None:
+        for aid, name in _ASSET_ID_TO_SYMBOL.items():
+            if _norm(name) == target_norm or target_norm in _norm(name):
+                STATE.tick_feed.asset_id_for_symbol = aid
+                break
+
+
+def _sanitize_preview(s: str) -> str:
+    if not s:
+        return s
+    if '["auth"' in s or '["user_init"' in s:
+        return "(redacted auth frame)"
+    return s
+
+
+def _feed_frame_preview(preview: str, kind: str) -> None:
+    tf = STATE.tick_feed
+    tf.frames_seen += 1
+    tf.frames_last_ts = time.time()
+    tail = tf.frames_tail or []
+    tail.append({"ts": tf.frames_last_ts, "kind": kind, "preview": _sanitize_preview(preview)[:160]})
+    if len(tail) > 10:
+        tail = tail[-10:]
+    tf.frames_tail = tail
+
+
+def _try_pick_tick_triplet(it: Any) -> Optional[Tuple[str, float, float]]:
+    if not (isinstance(it, list) and len(it) >= 3):
+        return None
+    sym = it[0]
+    try:
+        ts = float(it[1])
+        price = float(it[2])
+        if ts < 1_000_000_000:
+            return None
+    except Exception:
+        return None
+
+    if isinstance(sym, (int, float)):
+        name = _ASSET_ID_TO_SYMBOL.get(int(sym))
+        sym_str = name if name else str(int(sym))
+    else:
+        sym_str = str(sym)
+
+    return (sym_str, ts, price)
+
+
+def _find_ticks_recursive(obj: Any, limit: int = 50) -> List[Tuple[str, float, float]]:
+    out: List[Tuple[str, float, float]] = []
+
+    def walk(x: Any):
+        nonlocal out
+        if len(out) >= limit:
+            return
+        if isinstance(x, list):
+            t = _try_pick_tick_triplet(x)
+            if t:
+                out.append(t)
+                return
+            for y in x:
+                walk(y)
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+
+    walk(obj)
+    return out
+
+
+def _ha_for_series_seeded(closed: List[Dict[str, Any]], seed: Optional[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    if not closed:
+        return out
+
+    candles = sorted(closed, key=lambda c: int(c.get("timestamp", 0)))
+
+    seed_ts = None
+    seed_open = None
+    seed_close = None
+    if isinstance(seed, dict):
+        try:
+            seed_ts = int(seed.get("timestamp"))
+            seed_open = float(seed.get("ha_open"))
+            seed_close = float(seed.get("ha_close"))
+        except Exception:
+            seed_ts = None
+            seed_open = None
+            seed_close = None
+
+    # IMPORTANT:
+    # If we have a seed, HA must be chained only from that seed forward.
+    # Older candles must not influence the chain after restart.
+    if seed_ts is not None and seed_open is not None and seed_close is not None:
+        trimmed = []
+        for c in candles:
+            try:
+                ts = int(c.get("timestamp", 0))
+            except Exception:
+                ts = 0
+            if ts >= seed_ts:
+                trimmed.append(c)
+        if trimmed:
+            candles = trimmed
+
+    prev_ha_open: Optional[float] = None
+    prev_ha_close: Optional[float] = None
+    chained_from_seed = False
+
+    if candles and seed_ts is not None and seed_open is not None and seed_close is not None:
+        first_ts = int(candles[0].get("timestamp", 0))
+        if first_ts > seed_ts:
+            prev_ha_open = seed_open
+            prev_ha_close = seed_close
+            chained_from_seed = True
+
+    for c in candles:
+        try:
+            ts = int(c["timestamp"])
+            o = float(c["open"])
+            h = float(c["high"])
+            l = float(c["low"])
+            cl = float(c["close"])
+        except Exception:
+            continue
+
+        # exact anchor candle from persisted seed
+        if seed_ts is not None and seed_open is not None and seed_close is not None and ts == seed_ts:
+            ha_open = float(seed_open)
+            ha_close = float(seed_close)
+            ha_high = max(h, ha_open, ha_close)
+            ha_low = min(l, ha_open, ha_close)
+            ha_dir = "UP" if ha_close >= ha_open else "DOWN"
+            out[ts] = {
+                "ha_open": ha_open,
+                "ha_high": ha_high,
+                "ha_low": ha_low,
+                "ha_close": ha_close,
+                "ha_dir": ha_dir,
+                "ha_seeded": True,
+            }
+            prev_ha_open = ha_open
+            prev_ha_close = ha_close
+            chained_from_seed = True
+            continue
+
+        ha_close = (o + h + l + cl) / 4.0
+
+        if prev_ha_open is None or prev_ha_close is None:
+            ha_open = (o + cl) / 2.0
+            ha_seeded = False
+        else:
+            ha_open = (prev_ha_open + prev_ha_close) / 2.0
+            ha_seeded = chained_from_seed
+
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
+        ha_dir = "UP" if ha_close >= ha_open else "DOWN"
+
+        out[ts] = {
+            "ha_open": ha_open,
+            "ha_high": ha_high,
+            "ha_low": ha_low,
+            "ha_close": ha_close,
+            "ha_dir": ha_dir,
+            "ha_seeded": ha_seeded,
+        }
+
+        prev_ha_open = ha_open
+        prev_ha_close = ha_close
+
+    return out
+def _merged_closed_for_ha(src: str, tail: int = 500, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    hist = list(_get_history_closed(symbol))
+    stream = list(_get_stream_closed(symbol))
+
+    if "STREAM" in src:
+        merged = (hist[-tail:] if hist else []) + (stream[-tail:] if stream else [])
+    else:
+        merged = (hist[-tail:] if hist else []) or (stream[-tail:] if stream else [])
+
+    by_ts: Dict[int, Dict[str, Any]] = {}
+    for c in merged:
+        try:
+            ts = int(c.get("timestamp", 0))
+        except Exception:
+            ts = 0
+        if ts > 0:
+            by_ts[ts] = c  # stream overrides history on same timestamp
+
+    ordered = [by_ts[ts] for ts in sorted(by_ts.keys())]
+    if not ordered:
+        return ordered
+
+    # Keep only the final contiguous chain spaced by exactly 60 seconds.
+    contiguous = [ordered[-1]]
+    prev_ts = int(ordered[-1].get("timestamp", 0))
+
+    for c in reversed(ordered[:-1]):
+        try:
+            ts = int(c.get("timestamp", 0))
+        except Exception:
+            ts = 0
+        if ts > 0 and (prev_ts - ts) == 60:
+            contiguous.append(c)
+            prev_ts = ts
+        else:
+            break
+
+    contiguous.reverse()
+
+    if len(contiguous) > tail:
+        contiguous = contiguous[-tail:]
+
+    return contiguous
+def _attach_ha(candle: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if candle is None:
+        return None
+
+    src = str(candle.get("source", "")).upper()
+    series = _merged_closed_for_ha(src, tail=500)
+    seed = _get_seed_for_symbol(STATE.symbol)
+    ha_map = _ha_for_series_seeded(series, seed)
+    ts = int(candle.get("timestamp", 0))
+
+    out = dict(candle)
+    ha = ha_map.get(ts)
+    if ha:
+        out.update(ha)
+    return out
+
+
+def _debug_ha_last_payload(candle: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if candle is None:
+        return {"ok": False, "error": "no candle"}
+
+    src = str(candle.get("source", "")).upper()
+    series = _merged_closed_for_ha(src, tail=500)
+    seed = _get_seed_for_symbol(STATE.symbol)
+    ha_map = _ha_for_series_seeded(series, seed)
+
+    ts = int(candle.get("timestamp", 0))
+
+    ordered = []
+    for c in series:
+        try:
+            cts = int(c.get("timestamp", 0))
+        except Exception:
+            cts = 0
+        if cts > 0:
+            ordered.append((cts, c))
+    ordered.sort(key=lambda x: x[0])
+
+    idx = None
+    for i, (cts, _) in enumerate(ordered):
+        if cts == ts:
+            idx = i
+            break
+
+    prev_ts = ordered[idx - 1][0] if idx is not None and idx > 0 else None
+    prev_candle = ordered[idx - 1][1] if idx is not None and idx > 0 else None
+
+    cur_ha = ha_map.get(ts)
+    prev_ha = ha_map.get(prev_ts) if prev_ts is not None else None
+
+    out = {
+        "ok": True,
+        "symbol": sym,
+        "active_mode": STATE.active_mode,
+        "source": src,
+        "seed": seed,
+        "series_len": len(ordered),
+        "series_tail_timestamps": [x[0] for x in ordered[-15:]],
+        "current_timestamp": ts,
+        "current_open_time": candle.get("open_time"),
+        "current_close_time": candle.get("close_time"),
+        "current_raw": {
+            "open": candle.get("open"),
+            "high": candle.get("high"),
+            "low": candle.get("low"),
+            "close": candle.get("close"),
+        },
+        "current_ha": cur_ha,
+        "prev_timestamp": prev_ts,
+        "prev_open_time": _fmt(prev_ts) if prev_ts else None,
+        "prev_raw": {
+            "open": prev_candle.get("open") if prev_candle else None,
+            "high": prev_candle.get("high") if prev_candle else None,
+            "low": prev_candle.get("low") if prev_candle else None,
+            "close": prev_candle.get("close") if prev_candle else None,
+        } if prev_candle else None,
+        "prev_ha": prev_ha,
+    }
+
+    if prev_ha and cur_ha:
+        try:
+            out["expected_open_from_prev"] = (float(prev_ha["ha_open"]) + float(prev_ha["ha_close"])) / 2.0
+        except Exception:
+            out["expected_open_from_prev"] = None
+    else:
+        out["expected_open_from_prev"] = None
+
+    return out
+
+async def _tick_feed_playwright_ws():
+    global _TICK_FEED_RUN_ID, _PW_CTX, _PW_PAGE
+    _TICK_FEED_RUN_ID += 1
+    run_id = _TICK_FEED_RUN_ID
+
+    tf = STATE.tick_feed
+    tf.running = True
+    tf.last_err = "—"
+    tf.ws_seen = 0
+    tf.frames_seen = 0
+    tf.frames_last_ts = None
+    tf.frames_tail = []
+    tf.pending_event = None
+    tf.pending_ts = None
+    tf.asset_id_for_symbol = None
+    tf.asset_map_size = 0
+    tf.last_tick_event = None
+    tf.tick_time_mode = "unknown"
+    tf.ticks_seen = 0
+    tf.last_price = None
+    tf.last_tick_ts_raw = None
+    tf.last_tick_ts_used = None
+    tf.last_tick_local_ts = None
+    tf.last_tick_age_sec = None
+    tf.warmup_active = False
+    tf.warmup_until_open_ts = None
+    tf.warmup_note = "—"
+
+    _ASSET_ID_TO_SYMBOL.clear()
+    _SEEN_SYMBOLS.clear()
+
+    ctx = None
+    try:
+        os.makedirs(PO_PW_PROFILE_DIR, exist_ok=True)
+        async with async_playwright() as p:
+            browser = p.webkit if PO_PW_BROWSER == "webkit" else p.chromium
+            ctx = await browser.launch_persistent_context(
+                user_data_dir=PO_PW_PROFILE_DIR,
+                headless=PO_PW_HEADLESS,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            page = await ctx.new_page()
+            _PW_CTX = ctx
+            _PW_PAGE = page
+
+            def attach_ws(ws):
+                tf.ws_seen += 1
+                ws.on("framereceived", lambda payload: _handle_payload(payload, sent=False))
+                ws.on("framesent", lambda payload: _handle_payload(payload, sent=True))
+
+            def _handle_payload(payload, sent: bool):
+                try:
+                    kind = "sent" if sent else "recv"
+
+                    if isinstance(payload, bytes):
+                        s = payload.decode("utf-8", errors="ignore")
+                        _feed_frame_preview(s, kind + ":bytes")
+                        raw_text = s
+                        obj = _parse_json_from_anyframe(s)
+                    else:
+                        s = str(payload)
+                        _feed_frame_preview(s, kind + ":str")
+                        raw_text = s
+                        obj = _parse_json_from_anyframe(s)
+
+                    ev = _extract_socketio_event_name_if_placeholder(raw_text)
+                    if ev:
+                        tf.pending_event = ev
+                        tf.pending_ts = time.time()
+
+                    if obj is None:
+                        return
+
+                    paired_event = None
+                    paired_payload = obj
+
+                    if isinstance(obj, list) and len(obj) >= 2 and isinstance(obj[0], str):
+                        paired_event = obj[0]
+                        paired_payload = obj[1]
+                    else:
+                        if (not sent) and tf.pending_event and tf.pending_ts and (time.time() - tf.pending_ts) <= 2.0:
+                            paired_event = tf.pending_event
+                            paired_payload = obj
+                            tf.pending_event = None
+                            tf.pending_ts = None
+
+                    if paired_event:
+                        _maybe_ingest_assets(paired_event, paired_payload)
+
+                    ticks = _find_ticks_recursive(paired_payload, limit=50)
+                    if not ticks:
+                        ticks = _find_ticks_recursive(obj, limit=50)
+                    if not ticks:
+                        return
+
+                    async def apply():
+                        async with _lock:
+                            active_norm = _norm(STATE.symbol)
+                            for sym_str, t, price in ticks:
+                                _SEEN_SYMBOLS.add(sym_str)
+                                if _norm(sym_str) == active_norm:
+                                    _on_tick_for_symbol(STATE.symbol, t, price, event_name=paired_event)
+                                else:
+                                    for configured_sym in list(getattr(STATE, "symbols", []) or []):
+                                        if _norm(sym_str) == _norm(configured_sym):
+                                            _on_tick_for_symbol(configured_sym, t, price, event_name=paired_event)
+                                            break
+                            _update_hybrid_choice()
+
+                    asyncio.get_event_loop().call_soon_threadsafe(lambda: asyncio.create_task(apply()))
+
+                except Exception as e:
+                    tf.last_err = f"{type(e).__name__}: {e}"
+
+            page.on("websocket", attach_ws)
+            ctx.on("websocket", attach_ws)
+
+            await page.goto(PO_PW_URL, wait_until="domcontentloaded")
+            await asyncio.sleep(2.0)
+
+            try:
+                await _pw_switch_symbol_ui(STATE.symbol)
+                await asyncio.sleep(2.0)
+            except Exception:
+                pass
+
+            while not _stop_event.is_set():
+                if tf.last_tick_local_ts:
+                    tf.last_tick_age_sec = time.time() - tf.last_tick_local_ts
+                await asyncio.sleep(0.5)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        if run_id == _TICK_FEED_RUN_ID:
+            tf.last_err = f"{type(e).__name__}: {e}"
+    finally:
+        if run_id == _TICK_FEED_RUN_ID:
+            tf.running = False
+            _PW_CTX = None
+            _PW_PAGE = None
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
+
+def _pw_symbol_to_ui_text(symbol: str) -> str:
+    s = str(symbol or "").strip()
+    low = s.lower()
+    otc = low.endswith("_otc")
+    if otc:
+        s = s[:-4]
+
+    parts = s.split("_")
+    if len(parts) == 1 and len(s) == 6 and s.isalpha():
+        ui = f"{s[:3]}/{s[3:]}"
+    elif len(parts) == 1:
+        ui = s.replace("-", "/")
+    else:
+        ui = "/".join(parts)
+
+    return f"{ui.upper()} OTC" if otc else ui.upper()
+
+
+async def _pw_switch_symbol_ui(symbol: str) -> Dict[str, Any]:
+    page = _PW_PAGE
+    if page is None:
+        return {"ok": False, "error": "pw_page_not_ready", "symbol": symbol}
+
+    try:
+        ui_text = _pw_symbol_to_ui_text(symbol)
+
+        # 1) otevřít menu se symbolem
+        await page.locator("a.pair-number-wrap").first.click(timeout=2000)
+        await page.wait_for_timeout(700)
+
+        # 2) najít správnou položku v seznamu
+        item = page.locator(
+            "a.alist__link",
+            has=page.locator("span.alist__label", has_text=ui_text)
+        ).first
+
+        if await item.count() == 0:
+            return {
+                "ok": False,
+                "error": "symbol_not_found_in_list",
+                "symbol": symbol,
+                "ui_text": ui_text,
+            }
+
+        # 3) kliknout na symbol
+        await item.click(timeout=2000)
+        await page.wait_for_timeout(1200)
+
+        return {"ok": True, "symbol": symbol, "ui_text": ui_text}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "symbol": symbol}
+
+
+@app.post("/api/pw/switch_symbol_test")
+async def api_pw_switch_symbol_test(symbol: str):
+    return await _pw_switch_symbol_ui(symbol)
+
+
+async def _fetch_history_closed(client: Any, limit: int = 120, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    fn = getattr(client, "get_candles", None)
+    if not callable(fn):
+        return []
+    sym = symbol or STATE.symbol
+    res = fn(sym, TF_SEC, count=limit)
+    if inspect.isawaitable(res):
+        res = await res
+    if not res:
+        return []
+
+    candles: List[Dict[str, Any]] = []
+    for x in res:
+        dt = getattr(x, "timestamp", None)
+        if not isinstance(dt, datetime.datetime):
+            continue
+        ts_open = _align(int(dt.timestamp()) - int(STATE.po_time_offset_sec))
+        o, c = _open_close_str(ts_open)
+        candles.append({
+            "symbol": sym,
+            "timestamp": ts_open,
+            "open": float(x.open),
+            "high": float(x.high),
+            "low": float(x.low),
+            "close": float(x.close),
+            "volume": float(getattr(x, "volume", 0.0)),
+            "source": "HISTORY",
+            "open_time": o,
+            "close_time": c,
+        })
+
+    candles.sort(key=lambda cc: int(cc["timestamp"]))
+    closed = candles[:-1] if len(candles) >= 2 else []
+    for cc in closed:
+        cc["age_sec"] = _age_sec(int(cc["timestamp"]))
+    return closed[-300:]
+
+
+async def _restart_tick_feed(reason: str) -> None:
+    global _tick_task
+    if not PO_USE_PW:
+        return
+
+    now = time.time()
+    last = STATE.wd_last_restart_ts or 0.0
+    if (now - last) < STATE.wd_cooldown_sec:
+        return
+
+    STATE.wd_last_restart_ts = now
+    STATE.wd_last_reason = reason
+    STATE.wd_bad_count = 0
+    STATE.wd_engine_start_ts = now
+
+    tf = STATE.tick_feed
+    tf.last_tick_local_ts = None
+    tf.last_tick_age_sec = None
+
+    print(f"[WATCHDOG] restarting tick feed: {reason}")
+
+    old = _tick_task
+    _tick_task = None
+    if old is not None:
+        old.cancel()
+        try:
+            await asyncio.gather(old, return_exceptions=True)
+        except Exception:
+            pass
+
+    _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+
+
+async def _watchdog_check() -> None:
+    if not STATE.wd_enabled:
+        return
+
+    tf = STATE.tick_feed
+    now = time.time()
+
+    age = tf.last_tick_age_sec
+    running = tf.running
+    start_ts = float(getattr(STATE, "wd_engine_start_ts", 0.0) or 0.0)
+
+    bad = False
+    reason = "ok"
+
+    if not running:
+        bad = True
+        reason = "tick_feed_not_running"
+    else:
+        # no tick yet
+        if not tf.last_tick_local_ts:
+            # grace after engine start / tick-feed restart
+            if (now - start_ts) < STATE.wd_start_grace_sec:
+                bad = False
+                reason = "grace_no_ticks_yet"
+            # websocket or frames are alive => do not restart yet
+            elif int(getattr(tf, "ws_seen", 0) or 0) > 0 or int(getattr(tf, "frames_seen", 0) or 0) > 0:
+                bad = False
+                reason = "waiting_ticks_but_ws_alive"
+            else:
+                bad = True
+                reason = "no_ticks_yet"
+        else:
+            # stale ticks
+            if age is not None and float(age) > float(STATE.wd_tick_max_age_sec):
+                bad = True
+                reason = f"ticks_stale_{float(age):.1f}s"
+
+    if bad:
+        STATE.wd_bad_count += 1
+        STATE.wd_last_reason = reason
+        if STATE.wd_bad_count >= STATE.wd_fails_required:
+            await _restart_tick_feed(reason)
+    else:
+        STATE.wd_bad_count = 0
+        STATE.wd_last_reason = reason
+
+
+async def _engine_loop():
+    global _tick_task
+
+    STATE.last_connect_error = "—"
+    STATE.last_candles_error = "—"
+    STATE.last_fetch_count = 0
+    STATE.last_poll_ts = None
+
+    STATE.stream_current = None
+    STATE.stream_closed = []
+    STATE.stream = StreamStats()
+    STATE.active_mode = "HISTORY"
+    STATE.history_age_sec = None
+    STATE.stream_age_sec = None
+    STATE.tick_feed = TickFeedStats(frames_tail=[])
+
+    STATE.wd_bad_count = 0
+    STATE.wd_last_restart_ts = None
+    STATE.wd_last_reason = "—"
+    STATE.wd_engine_start_ts = time.time()
+
+    ssid = _read_ssid()
+    if not ssid:
+        STATE.connected = False
+        STATE.last_connect_error = "Missing SSID"
+        return
+
+    try:
+        client = AsyncPocketOptionClient(ssid=ssid, is_demo=STATE.is_demo, enable_logging=False)
+        await client.connect()
+        STATE.connected = True
+    except Exception as e:
+        STATE.connected = False
+        STATE.last_connect_error = f"{type(e).__name__}: {e}"
+        return
+
+    if PO_USE_PW:
+        STATE.wd_engine_start_ts = time.time()
+        STATE.wd_engine_start_ts = time.time()
+        _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+    else:
+        _tick_task = None
+
+    last_hist = 0.0
+
+    while not _stop_event.is_set():
+        now = time.time()
+        STATE.last_poll_ts = now
+
+        try:
+            await _watchdog_check()
+        except Exception:
+            pass
+
+        if (now - last_hist) >= 2.0:
+            last_hist = now
+            total_fetch_count = 0
+            last_active_hist_closed = None
+            symbol_errors = []
+
+            for sym in list(getattr(STATE, "symbols", []) or [STATE.symbol]):
+                try:
+                    hist_closed = await _fetch_history_closed(
+                        client,
+                        limit=_history_limit_from_seed(default=120, maximum=1500),
+                        symbol=sym,
+                    )
+                    ss = _get_symbol_state(sym)
+                    ss.history_closed = hist_closed
+                    total_fetch_count += len(hist_closed)
+                    if sym == STATE.symbol:
+                        last_active_hist_closed = hist_closed
+                except Exception as e:
+                    symbol_errors.append(f"{sym}:{type(e).__name__}:{e}")
+
+            async with _lock:
+                if last_active_hist_closed is not None:
+                    STATE.history_closed = last_active_hist_closed
+                STATE.last_fetch_count = total_fetch_count
+                _update_hybrid_choice()
+
+            try:
+                await _strategy_v1__maybe_auto_switch_symbol()
+            except Exception:
+                pass
+
+            STATE.last_candles_error = "—" if not symbol_errors else " | ".join(symbol_errors[:5])
+
+        await asyncio.sleep(1.0)
+
+    if _tick_task:
+        _tick_task.cancel()
+        try:
+            await asyncio.gather(_tick_task, return_exceptions=True)
+        except Exception:
+            pass
+
+    STATE.connected = False
+
+
+@app.get("/api/start")
+async def api_start():
+    global _engine_task
+    lock = _get_engine_start_async_lock()
+    async with lock:
+        if _engine_task and not _engine_task.done():
+            STATE.running = True
+            return {"ok": True, "msg": "already running"}
+        _stop_event.clear()
+        STATE.running = True
+        _engine_task = asyncio.create_task(_engine_loop())
+        return {"ok": True, "msg": "started"}
+
+
+@app.post("/api/stop")
+async def api_stop():
+    global _engine_task
+    if not STATE.running:
+        return {"ok": True, "msg": "already stopped"}
+    _stop_event.set()
+    STATE.running = False
+    if _engine_task:
+        try:
+            await asyncio.wait_for(_engine_task, timeout=8.0)
+        except Exception:
+            pass
+    return {"ok": True, "msg": "stopped"}
+
+
+@app.post("/api/ha_seed")
+def api_ha_seed(payload: Dict[str, Any] = Body(...)):
+    try:
+        ha_open = float(payload["ha_open"])
+        ha_close = float(payload["ha_close"])
+    except Exception:
+        return {"ok": False, "error": "Missing/invalid ha_open or ha_close"}
+
+    ts = payload.get("timestamp", None)
+    if ts is None:
+        last = _active_last_closed()
+        if not last:
+            return {"ok": False, "error": "No last closed candle available to seed"}
+        ts = int(last.get("timestamp"))
+    else:
+        try:
+            ts = int(ts)
+        except Exception:
+            return {"ok": False, "error": "Invalid timestamp"}
+
+    sym = STATE.symbol
+    _HA_SEEDS[sym] = {"timestamp": ts, "ha_open": ha_open, "ha_close": ha_close, "updated_at": time.time()}
+    _save_ha_seeds()
+    return {"ok": True, "symbol": sym, "saved": _HA_SEEDS[sym]}
+
+
+@app.get("/api/tick_status")
+def api_tick_status():
+    tf = STATE.tick_feed
+    sym = STATE.symbol
+    ss = _get_symbol_state(sym)
+    return {
+        "ok": True,
+        "symbol": sym,
+        "tick_feed": {
+            "browser": tf.browser,
+            "running": tf.running,
+            "last_err": tf.last_err,
+            "ws_seen": tf.ws_seen,
+            "frames_seen": tf.frames_seen,
+            "ticks_seen": tf.ticks_seen,
+            "last_price": tf.last_price,
+            "last_tick_age_sec": tf.last_tick_age_sec,
+            "last_tick_event": tf.last_tick_event,
+            "tick_time_mode": tf.tick_time_mode,
+            "warmup_active": tf.warmup_active,
+            "warmup_note": tf.warmup_note,
+            "asset_id_for_symbol": tf.asset_id_for_symbol,
+            "asset_map_size": tf.asset_map_size,
+            "ha_seed_for_symbol": _get_seed_for_symbol(STATE.symbol),
+            "pending_event": tf.pending_event,
+            "frames_tail": tf.frames_tail,
+        },
+        "stream_ticks_seen": STATE.stream.ticks_seen,
+        "stream_closed_len": len(getattr(ss, "stream_closed", []) or []),
+        "active_mode": STATE.active_mode,
+        "watchdog": {
+            "enabled": STATE.wd_enabled,
+            "tick_max_age_sec": STATE.wd_tick_max_age_sec,
+            "fails_required": STATE.wd_fails_required,
+            "cooldown_sec": STATE.wd_cooldown_sec,
+            "start_grace_sec": STATE.wd_start_grace_sec,
+            "bad_count": STATE.wd_bad_count,
+            "last_restart_ts": STATE.wd_last_restart_ts,
+            "last_reason": STATE.wd_last_reason,
+        },
+    }
+
+
+@app.get("/api/last")
+def api_last(closed: int = 0):
+    if closed == 1:
+        c = _attach_ha(_active_last_closed())
+        return {"ok": True, "closed": True, "candle": c, "active_mode": STATE.active_mode}
+    current_stream = _get_stream_current()
+    if STATE.active_mode == "STREAM" and current_stream is not None:
+        c = _attach_ha(current_stream)
+        return {"ok": True, "closed": False, "candle": c, "active_mode": STATE.active_mode}
+    c = _attach_ha(_active_last_closed())
+    return {"ok": True, "closed": True, "candle": c, "active_mode": STATE.active_mode}
+
+
+@app.get("/api/debug_ha_last")
+def api_debug_ha_last():
+    c = _active_last_closed()
+    return _debug_ha_last_payload(c)
+
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/dashboard", status_code=307)
+
+
+@app.get("/api/symbols")
+def api_symbols():
+    return {
+        "ok": True,
+        "active_symbol": STATE.symbol,
+        "symbols": list(getattr(STATE, "symbols", []) or []),
+        "by_symbol_keys": list((getattr(STATE, "by_symbol", {}) or {}).keys()),
+    }
+
+
+def _effective_active_mode_for_symbol(symbol: Optional[str]) -> str:
+    ss = _get_symbol_state(symbol or STATE.symbol)
+    stream_closed_len = len(getattr(ss, "stream_closed", []) or [])
+    return "STREAM" if stream_closed_len >= 2 else "HISTORY"
+
+
+@app.get("/api/symbols/debug_all")
+def api_symbols_debug_all():
+    out = []
+    by_symbol = getattr(STATE, "by_symbol", {}) or {}
+    for sym in list(getattr(STATE, "symbols", []) or []):
+        ss = by_symbol.get(sym)
+        out.append({
+            "symbol": sym,
+            "is_active": sym == STATE.symbol,
+            "exists": ss is not None,
+            "history_closed_len": len(getattr(ss, "history_closed", []) or []) if ss else 0,
+            "stream_closed_len": len(getattr(ss, "stream_closed", []) or []) if ss else 0,
+            "has_stream_current": bool(getattr(ss, "stream_current", None)) if ss else False,
+            "active_mode": _effective_active_mode_for_symbol(sym) if ss else None,
+        })
+    return {
+        "ok": True,
+        "active_symbol": STATE.symbol,
+        "items": out,
+    }
+
+STRATEGY_V1_LOOKBACK = 7
+STRATEGY_V1_TREND_WINDOW = 5
+STRATEGY_V1_EPS = 1e-9
+
+
+def _strategy_v1__dedup_by_timestamp(items):
+    out = []
+    seen = set()
+    for item in reversed(items):
+        ts = None
+        if isinstance(item, dict):
+            ts = item.get("timestamp")
+        if ts in seen:
+            continue
+        seen.add(ts)
+        out.append(item)
+    out.reverse()
+    return out
+
+
+def _strategy_v1__to_dict(x):
+    if isinstance(x, dict):
+        return dict(x)
+    if hasattr(x, "model_dump"):
+        try:
+            return dict(x.model_dump())
+        except Exception:
+            pass
+    if hasattr(x, "dict"):
+        try:
+            return dict(x.dict())
+        except Exception:
+            pass
+    data = {}
+    for key in (
+        "symbol", "timestamp", "open", "high", "low", "close", "volume",
+        "source", "open_time", "close_time", "age_sec"
+    ):
+        if hasattr(x, key):
+            try:
+                data[key] = getattr(x, key)
+            except Exception:
+                pass
+    return data
+
+
+def _strategy_v1__get_closed_raw():
+    history_items = list(getattr(STATE, "history_closed", []) or [])
+    stream_items = list(getattr(STATE, "stream_closed", []) or [])
+    merged = [_strategy_v1__to_dict(x) for x in history_items + stream_items]
+    merged = [x for x in merged if isinstance(x, dict) and x.get("timestamp") is not None]
+    merged = _strategy_v1__dedup_by_timestamp(merged)
+    merged.sort(key=lambda x: x.get("timestamp", 0))
+    return merged
+
+
+def _strategy_v1__compute_ha(raw_items):
+    out = []
+    prev_ha_open = None
+    prev_ha_close = None
+
+    for raw in raw_items:
+        c = _strategy_v1__to_dict(raw)
+
+        if not all(k in c for k in ("open", "high", "low", "close")):
+            out.append(c)
+            continue
+
+        o = float(c["open"])
+        h = float(c["high"])
+        l = float(c["low"])
+        cl = float(c["close"])
+
+        ha_close = (o + h + l + cl) / 4.0
+
+        if prev_ha_open is None or prev_ha_close is None:
+            ha_open = (o + cl) / 2.0
+        else:
+            ha_open = (prev_ha_open + prev_ha_close) / 2.0
+
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
+        ha_dir = "UP" if ha_close >= ha_open else "DOWN"
+
+        c["ha_open"] = ha_open
+        c["ha_high"] = ha_high
+        c["ha_low"] = ha_low
+        c["ha_close"] = ha_close
+        c["ha_dir"] = ha_dir
+
+        prev_ha_open = ha_open
+        prev_ha_close = ha_close
+        out.append(c)
+
+    return out
+
+
+def _strategy_v1__get_closed_ha():
+    return _strategy_v1__compute_ha(_strategy_v1__get_closed_raw())
+
+
+def _strategy_v1__get_forming_ha():
+    current = getattr(STATE, "stream_current", None)
+    if not current:
+        return None
+
+    closed_ha = _strategy_v1__get_closed_ha()
+    raw_items = [_strategy_v1__to_dict(x) for x in _strategy_v1__get_closed_raw()]
+    raw_items.append(_strategy_v1__to_dict(current))
+    full = _strategy_v1__compute_ha(raw_items)
+    if not full:
+        return None
+
+    forming = full[-1]
+    last_closed_ts = closed_ha[-1]["timestamp"] if closed_ha else None
+    forming["is_new_after_closed"] = (
+        last_closed_ts is not None and forming.get("timestamp") != last_closed_ts
+    )
+    return forming
+
+
+def _strategy_v1__body_size(c):
+    return abs(float(c["ha_close"]) - float(c["ha_open"]))
+
+
+def _strategy_v1__upper_wick(c):
+    return float(c["ha_high"]) - max(float(c["ha_open"]), float(c["ha_close"]))
+
+
+def _strategy_v1__lower_wick(c):
+    return min(float(c["ha_open"]), float(c["ha_close"])) - float(c["ha_low"])
+
+
+def _strategy_v1__is_cross(c, eps=STRATEGY_V1_EPS):
+    try:
+        return _strategy_v1__upper_wick(c) > eps and _strategy_v1__lower_wick(c) > eps
+    except Exception:
+        return False
+
+
+def _strategy_v1__alternations(items):
+    if len(items) < 2:
+        return 0
+    n = 0
+    prev = items[0].get("ha_dir")
+    for item in items[1:]:
+        cur = item.get("ha_dir")
+        if cur != prev:
+            n += 1
+        prev = cur
+    return n
+
+
+def _strategy_v1__trend_state(closed_ha):
+    window = closed_ha[-STRATEGY_V1_TREND_WINDOW:] if len(closed_ha) >= 1 else []
+
+    if len(window) < 3:
+        return {
+            "trend_buy": False,
+            "trend_sell": False,
+            "chaos": True,
+            "up_count": 0,
+            "down_count": 0,
+            "alternations": 0,
+            "net_ha_move": 0.0,
+            "last2_up": 0,
+            "last2_down": 0,
+            "last3_up": 0,
+            "last3_down": 0,
+            "cross_count": 0,
+            "clean_body_count": 0,
+            "env_ok": False,
+            "reason": "not_enough_closed_candles"
+        }
+
+    up_count = sum(1 for x in window if x.get("ha_dir") == "UP")
+    down_count = sum(1 for x in window if x.get("ha_dir") == "DOWN")
+    alternations = _strategy_v1__alternations(window)
+    net_ha_move = float(window[-1]["ha_close"]) - float(window[0]["ha_close"])
+
+    last2 = window[-2:]
+    last3 = window[-3:]
+
+    last2_up = sum(1 for x in last2 if x.get("ha_dir") == "UP")
+    last2_down = sum(1 for x in last2 if x.get("ha_dir") == "DOWN")
+    last3_up = sum(1 for x in last3 if x.get("ha_dir") == "UP")
+    last3_down = sum(1 for x in last3 if x.get("ha_dir") == "DOWN")
+
+    cross_count = sum(1 for x in window if _strategy_v1__is_cross(x))
+
+    clean_body_count = 0
+    for x in window:
+        body = _strategy_v1__body_size(x)
+        upper = _strategy_v1__upper_wick(x)
+        lower = _strategy_v1__lower_wick(x)
+        if body > (upper + lower):
+            clean_body_count += 1
+
+    env_ok = (
+        alternations <= 2 and
+        cross_count <= 3 and
+        clean_body_count >= 1
+    )
+
+    trend_buy_base = (
+        up_count >= 4 and
+        net_ha_move > 0 and
+        env_ok
+    )
+
+    trend_sell_base = (
+        down_count >= 4 and
+        net_ha_move < 0 and
+        env_ok
+    )
+
+    recent_buy_push = (
+        (last2_up == 2) or
+        (last3_up >= 2 and float(last3[-1]["ha_close"]) >= float(last3[0]["ha_close"]))
+    )
+
+    recent_sell_push = (
+        (last2_down == 2) or
+        (last3_down >= 2 and float(last3[-1]["ha_close"]) <= float(last3[0]["ha_close"]))
+    )
+
+    trend_buy = trend_buy_base and not recent_sell_push
+    trend_sell = trend_sell_base and not recent_buy_push
+
+    if recent_buy_push and not recent_sell_push:
+        trend_sell = False
+
+    if recent_sell_push and not recent_buy_push:
+        trend_buy = False
+
+    chaos = (
+        alternations >= 4 or
+        cross_count >= 4 or
+        (not env_ok and alternations >= 3) or
+        (not trend_buy and not trend_sell)
+    )
+
+    reason = []
+    if trend_buy:
+        reason.append("trend_buy_ok")
+    if trend_sell:
+        reason.append("trend_sell_ok")
+    if recent_buy_push:
+        reason.append("recent_buy_push")
+    if recent_sell_push:
+        reason.append("recent_sell_push")
+    if not env_ok:
+        reason.append("environment_not_clean")
+    if chaos:
+        reason.append("chaos_or_no_trade")
+
+    return {
+        "trend_buy": trend_buy,
+        "trend_sell": trend_sell,
+        "chaos": chaos,
+        "up_count": up_count,
+        "down_count": down_count,
+        "alternations": alternations,
+        "net_ha_move": net_ha_move,
+        "last2_up": last2_up,
+        "last2_down": last2_down,
+        "last3_up": last3_up,
+        "last3_down": last3_down,
+        "cross_count": cross_count,
+        "clean_body_count": clean_body_count,
+        "env_ok": env_ok,
+        "reason": ",".join(reason) if reason else "neutral"
+    }
+
+
+def _strategy_v1__reaction_buy_ok(forming):
+    if not forming:
+        return False
+    try:
+        return (
+            forming.get("ha_dir") == "UP" and
+            _strategy_v1__lower_wick(forming) <= STRATEGY_V1_EPS and
+            _strategy_v1__body_size(forming) > STRATEGY_V1_EPS
+        )
+    except Exception:
+        return False
+
+
+def _strategy_v1__reaction_sell_ok(forming):
+    if not forming:
+        return False
+    try:
+        return (
+            forming.get("ha_dir") == "DOWN" and
+            _strategy_v1__upper_wick(forming) <= STRATEGY_V1_EPS and
+            _strategy_v1__body_size(forming) > STRATEGY_V1_EPS
+        )
+    except Exception:
+        return False
+
+
+def _strategy_v1__build_debug():
+    closed_ha = _strategy_v1__get_closed_ha()
+    forming = _strategy_v1__get_forming_ha()
+
+    trend = _strategy_v1__trend_state(closed_ha)
+
+    prev_candle = closed_ha[-2] if len(closed_ha) >= 2 else None
+    last_candle = closed_ha[-1] if len(closed_ha) >= 1 else None
+
+    prev_candle_is_cross = _strategy_v1__is_cross(prev_candle) if prev_candle else False
+    last_candle_is_cross = _strategy_v1__is_cross(last_candle) if last_candle else False
+    two_crosses = prev_candle_is_cross and last_candle_is_cross
+
+    def _window_bias_info(window_size: int):
+        items = list(closed_ha[-window_size:] if closed_ha else [])
+        if not items:
+            return {
+                "window": window_size,
+                "bias": "CHAOS",
+                "reason": "no_data",
+                "up_count": 0,
+                "down_count": 0,
+                "cross_count": 0,
+                "alternations": 0,
+                "net_ha_move": 0.0,
+                "longest_up_block": 0,
+                "longest_down_block": 0,
+                "right_run_dir": "NONE",
+                "right_run_len": 0,
+                "clean_body_count": 0,
+                "chop_penalty": 0,
+            }
+
+        dirs = []
+        for x in items:
+            d = x.get("ha_dir")
+            if d not in ("UP", "DOWN"):
+                try:
+                    d = "UP" if float(x.get("ha_close", 0)) >= float(x.get("ha_open", 0)) else "DOWN"
+                except Exception:
+                    d = "DOWN"
+            dirs.append(d)
+
+        up_count = sum(1 for d in dirs if d == "UP")
+        down_count = sum(1 for d in dirs if d == "DOWN")
+        cross_count = sum(1 for x in items if _strategy_v1__is_cross(x))
+        alternations = _strategy_v1__alternations(items)
+        clean_body_count = sum(1 for x in items if not _strategy_v1__is_cross(x))
+
+        try:
+            net_ha_move = float(items[-1].get("ha_close", 0)) - float(items[0].get("ha_open", 0))
+        except Exception:
+            net_ha_move = 0.0
+
+        longest_up_block = 0
+        longest_down_block = 0
+        cur_dir = None
+        cur_len = 0
+        for d in dirs:
+            if d == cur_dir:
+                cur_len += 1
+            else:
+                cur_dir = d
+                cur_len = 1
+            if d == "UP":
+                longest_up_block = max(longest_up_block, cur_len)
+            else:
+                longest_down_block = max(longest_down_block, cur_len)
+
+        right_run_dir = dirs[-1] if dirs else "NONE"
+        right_run_len = 0
+        for d in reversed(dirs):
+            if d == right_run_dir:
+                right_run_len += 1
+            else:
+                break
+
+        cross_cap = max(2, len(items) // 4)
+        clean_cap = max(2, len(items) // 2)
+
+        dominant_up_clean = bool(
+            up_count >= max(down_count + 3, int(len(items) * 0.65)) and
+            right_run_dir == "UP" and
+            right_run_len >= 3 and
+            alternations <= 2 and
+            cross_count <= cross_cap and
+            clean_body_count >= clean_cap and
+            longest_up_block >= 3
+        )
+
+        dominant_down_clean = bool(
+            down_count >= max(up_count + 3, int(len(items) * 0.65)) and
+            right_run_dir == "DOWN" and
+            right_run_len >= 3 and
+            alternations <= 2 and
+            cross_count <= cross_cap and
+            clean_body_count >= clean_cap and
+            longest_down_block >= 3
+        )
+
+        bias = "CHAOS"
+        reason = "mixed_or_choppy"
+        if dominant_up_clean:
+            bias = "BUY"
+            reason = "dominant_up_clean"
+        elif dominant_down_clean:
+            bias = "SELL"
+            reason = "dominant_down_clean"
+
+        chop_penalty = cross_count + alternations + max(0, clean_cap - clean_body_count)
+
+        return {
+            "window": window_size,
+            "bias": bias,
+            "reason": reason,
+            "up_count": up_count,
+            "down_count": down_count,
+            "cross_count": cross_count,
+            "alternations": alternations,
+            "net_ha_move": net_ha_move,
+            "longest_up_block": longest_up_block,
+            "longest_down_block": longest_down_block,
+            "right_run_dir": right_run_dir,
+            "right_run_len": right_run_len,
+            "clean_body_count": clean_body_count,
+            "chop_penalty": chop_penalty,
+        }
+
+    market_bias_windows = [_window_bias_info(w) for w in (8, 12, 16)]
+    buy_votes = sum(1 for w in market_bias_windows if w.get("bias") == "BUY")
+    sell_votes = sum(1 for w in market_bias_windows if w.get("bias") == "SELL")
+    chaos_votes = sum(1 for w in market_bias_windows if w.get("bias") == "CHAOS")
+
+    market_bias_gate = "CHAOS"
+    if buy_votes >= 2 and sell_votes == 0:
+        market_bias_gate = "BUY"
+    elif sell_votes >= 2 and buy_votes == 0:
+        market_bias_gate = "SELL"
+
+    market_bias_reason = f"chaos_votes={chaos_votes},buy_votes={buy_votes},sell_votes={sell_votes}"
+    market_bias_blocks_entry = (market_bias_gate == "CHAOS")
+
+    local_state = "NONE"
+    local_state_reason = "no_local_pattern"
+
+    right_edge_cross_ok = bool(
+        (last_candle_is_cross and not prev_candle_is_cross) or
+        (not last_candle_is_cross)
+    )
+
+    local_edge_clean_ok = bool(
+        trend["env_ok"] and
+        trend["alternations"] <= 1 and
+        trend["cross_count"] <= 2 and
+        right_edge_cross_ok
+    )
+
+    local_buy_dominance_ok = bool(
+        trend["last2_up"] == 2 and
+        trend["up_count"] >= trend["down_count"] and
+        trend["net_ha_move"] > 0 and
+        trend["down_count"] <= 1
+    )
+
+    local_sell_dominance_ok = bool(
+        trend["last2_down"] == 2 and
+        trend["down_count"] >= trend["up_count"] and
+        trend["net_ha_move"] < 0 and
+        trend["up_count"] <= 1
+    )
+
+    if market_bias_gate == "BUY" and trend["last2_up"] == 2:
+        local_state = "WAIT_BUY"
+        local_state_reason = "bias_buy_and_last2_up"
+    elif market_bias_gate == "SELL" and trend["last2_down"] == 2:
+        local_state = "WAIT_SELL"
+        local_state_reason = "bias_sell_and_last2_down"
+    elif market_bias_gate != "BUY" and local_edge_clean_ok and local_buy_dominance_ok:
+        local_state = "EARLY_BUY"
+        local_state_reason = "right_edge_turning_up_before_bias_buy"
+    elif market_bias_gate != "SELL" and local_edge_clean_ok and local_sell_dominance_ok:
+        local_state = "EARLY_SELL"
+        local_state_reason = "right_edge_turning_down_before_bias_sell"
+
+    market_state_v2 = "CHAOS"
+    market_state_v2_reason = "bias_local_not_aligned"
+
+    short_window = None
+    for w in market_bias_windows:
+        if int(w.get("window", 0) or 0) == 8:
+            short_window = w
+            break
+
+    short_bias = short_window.get("bias") if short_window else None
+    short_reason = short_window.get("reason") if short_window else None
+
+    strong_short_buy_override = bool(
+        market_bias_gate == "CHAOS" and
+        short_bias == "BUY" and
+        short_reason == "dominant_up_clean" and
+        trend["env_ok"] and
+        trend["last2_up"] == 2 and
+        trend["last3_up"] >= 2 and
+        local_state in ("EARLY_BUY", "WAIT_BUY")
+    )
+
+    strong_short_sell_override = bool(
+        market_bias_gate == "CHAOS" and
+        short_bias == "SELL" and
+        short_reason == "dominant_down_clean" and
+        trend["env_ok"] and
+        trend["last2_down"] == 2 and
+        trend["last3_down"] >= 2 and
+        local_state in ("EARLY_SELL", "WAIT_SELL")
+    )
+
+    if market_bias_gate == "BUY" and local_state == "WAIT_BUY":
+        market_state_v2 = "CLEAN_BUY"
+        market_state_v2_reason = "bias_buy_plus_wait_buy"
+    elif market_bias_gate == "SELL" and local_state == "WAIT_SELL":
+        market_state_v2 = "CLEAN_SELL"
+        market_state_v2_reason = "bias_sell_plus_wait_sell"
+    elif strong_short_buy_override and local_state == "WAIT_BUY":
+        market_state_v2 = "CLEAN_BUY"
+        market_state_v2_reason = "short_window_8_buy_override"
+    elif strong_short_sell_override and local_state == "WAIT_SELL":
+        market_state_v2 = "CLEAN_SELL"
+        market_state_v2_reason = "short_window_8_sell_override"
+    elif strong_short_buy_override and local_state == "EARLY_BUY":
+        market_state_v2 = "EARLY_BUY"
+        market_state_v2_reason = "short_window_8_early_buy_override"
+    elif strong_short_sell_override and local_state == "EARLY_SELL":
+        market_state_v2 = "EARLY_SELL"
+        market_state_v2_reason = "short_window_8_early_sell_override"
+    elif market_bias_gate == "CHAOS" and local_state == "EARLY_BUY":
+        market_state_v2 = "EARLY_BUY"
+        market_state_v2_reason = "chaos_bias_but_right_edge_early_buy"
+    elif market_bias_gate == "CHAOS" and local_state == "EARLY_SELL":
+        market_state_v2 = "EARLY_SELL"
+        market_state_v2_reason = "chaos_bias_but_right_edge_early_sell"
+
+    market_state_main = market_state_v2
+    market_state_main_reason = market_state_v2_reason
+    market_state_buy = market_state_main in ("EARLY_BUY", "CLEAN_BUY")
+    market_state_sell = market_state_main in ("EARLY_SELL", "CLEAN_SELL")
+
+    raw_prepare_buy = bool(
+        market_state_buy and
+        two_crosses and
+        not market_bias_blocks_entry
+    )
+    raw_prepare_sell = bool(
+        market_state_sell and
+        two_crosses and
+        not market_bias_blocks_entry
+    )
+
+    symbol = getattr(STATE, "symbol", None) or "?"
+    tracker = STRATEGY_V1_SETUP_TRACKERS.get(symbol)
+    tracker_just_created = False
+    last_closed_ts = last_candle.get("timestamp") if last_candle else None
+
+    if tracker and tracker.get("last_closed_ts") != last_closed_ts and last_closed_ts is not None:
+        tracker["candles_waited"] = int(tracker.get("candles_waited", 0) or 0) + 1
+        tracker["last_closed_ts"] = last_closed_ts
+
+    if raw_prepare_buy and not tracker:
+        tracker = {
+            "side": "BUY",
+            "candles_waited": 0,
+            "start_closed_ts": last_closed_ts,
+            "last_closed_ts": last_closed_ts,
+        }
+        STRATEGY_V1_SETUP_TRACKERS[symbol] = tracker
+        tracker_just_created = True
+    elif raw_prepare_sell and not tracker:
+        tracker = {
+            "side": "SELL",
+            "candles_waited": 0,
+            "start_closed_ts": last_closed_ts,
+            "last_closed_ts": last_closed_ts,
+        }
+        STRATEGY_V1_SETUP_TRACKERS[symbol] = tracker
+        tracker_just_created = True
+
+    tracker = STRATEGY_V1_SETUP_TRACKERS.get(symbol)
+
+    setup_timeout = False
+    setup_chaos_reset = False
+    if tracker:
+        if market_state_main == "CHAOS" or market_bias_blocks_entry:
+            setup_chaos_reset = True
+            STRATEGY_V1_SETUP_TRACKERS.pop(symbol, None)
+            tracker = None
+        elif int(tracker.get("candles_waited", 0) or 0) >= 3:
+            setup_timeout = True
+            STRATEGY_V1_SETUP_TRACKERS.pop(symbol, None)
+            tracker = None
+
+    prepare_buy = bool(tracker and tracker.get("side") == "BUY" and market_state_buy and not setup_timeout and not setup_chaos_reset)
+    prepare_sell = bool(tracker and tracker.get("side") == "SELL" and market_state_sell and not setup_timeout and not setup_chaos_reset)
+
+    new_candle_started = bool(forming and forming.get("is_new_after_closed"))
+    new_candle_direction_buy_ok = bool(forming and float(forming.get("close", 0)) > float(forming.get("open", 0)))
+    new_candle_direction_sell_ok = bool(forming and float(forming.get("close", 0)) < float(forming.get("open", 0)))
+
+    reaction_buy_ok = bool(_strategy_v1__reaction_buy_ok(forming))
+    reaction_sell_ok = bool(_strategy_v1__reaction_sell_ok(forming))
+
+    final_buy = bool(prepare_buy and reaction_buy_ok and not tracker_just_created)
+    final_sell = bool(prepare_sell and reaction_sell_ok and not tracker_just_created)
+
+    if final_buy or final_sell:
+        STRATEGY_V1_SETUP_TRACKERS.pop(symbol, None)
+
+    reason = []
+    if market_state_main == "CHAOS":
+        reason.append("main_chaos")
+    if market_bias_blocks_entry:
+        reason.append("market_bias_chaos_block")
+    if two_crosses:
+        reason.append("two_crosses")
+    if prepare_buy:
+        reason.append("prepare_buy")
+    if prepare_sell:
+        reason.append("prepare_sell")
+    if final_buy:
+        reason.append("final_buy")
+    if final_sell:
+        reason.append("final_sell")
+    if setup_timeout:
+        reason.append("setup_timeout_3_candles")
+    if setup_chaos_reset:
+        reason.append("setup_reset_chaos")
+    if not reason:
+        reason.append("no_signal")
+
+    if final_buy:
+        state = "FINAL_BUY"
+    elif final_sell:
+        state = "FINAL_SELL"
+    elif prepare_buy:
+        state = "PREPARE_BUY"
+    elif prepare_sell:
+        state = "PREPARE_SELL"
+    elif market_state_main == "CHAOS":
+        state = "CHAOS_NO_TRADE"
+    elif market_state_main == "CLEAN_BUY":
+        state = "CLEAN_BUY"
+    elif market_state_main == "CLEAN_SELL":
+        state = "CLEAN_SELL"
+    elif market_state_main == "EARLY_BUY":
+        state = "EARLY_BUY"
+    elif market_state_main == "EARLY_SELL":
+        state = "EARLY_SELL"
+    else:
+        state = "NO_SIGNAL"
+
+    snapshot = []
+    for x in closed_ha[-STRATEGY_V1_LOOKBACK:]:
+        row = {
+            "timestamp": x.get("timestamp"),
+            "open_time": x.get("open_time"),
+            "ha_open": x.get("ha_open"),
+            "ha_high": x.get("ha_high"),
+            "ha_low": x.get("ha_low"),
+            "ha_close": x.get("ha_close"),
+            "ha_dir": x.get("ha_dir"),
+            "is_cross": _strategy_v1__is_cross(x),
+        }
+        snapshot.append(row)
+
+    forming_out = None
+    if forming:
+        forming_out = {
+            "timestamp": forming.get("timestamp"),
+            "open_time": forming.get("open_time"),
+            "close_time": forming.get("close_time"),
+            "open": forming.get("open"),
+            "high": forming.get("high"),
+            "low": forming.get("low"),
+            "close": forming.get("close"),
+            "ha_open": forming.get("ha_open"),
+            "ha_high": forming.get("ha_high"),
+            "ha_low": forming.get("ha_low"),
+            "ha_close": forming.get("ha_close"),
+            "ha_dir": forming.get("ha_dir"),
+            "is_new_after_closed": forming.get("is_new_after_closed"),
+            "lower_wick": _strategy_v1__lower_wick(forming),
+            "upper_wick": _strategy_v1__upper_wick(forming),
+            "body_size": _strategy_v1__body_size(forming),
+        }
+
+    return {
+        "ok": True,
+        "symbol": getattr(STATE, "symbol", None),
+        "active_mode": getattr(STATE, "active_mode", None),
+        "state": state,
+        "market_state": market_state_main,
+        "market_state_main": market_state_main,
+        "market_state_main_reason": market_state_main_reason,
+        "market_bias": market_bias_gate,
+        "market_bias_reason": market_bias_reason,
+        "market_bias_windows": market_bias_windows,
+        "local_state": local_state,
+        "local_state_reason": local_state_reason,
+        "market_state_v2": market_state_v2,
+        "market_state_v2_reason": market_state_v2_reason,
+        "trend_buy": trend["trend_buy"],
+        "trend_sell": trend["trend_sell"],
+        "chaos": market_state_main == "CHAOS",
+        "up_count": trend["up_count"],
+        "down_count": trend["down_count"],
+        "alternations": trend["alternations"],
+        "net_ha_move": trend["net_ha_move"],
+        "last2_up": trend["last2_up"],
+        "last2_down": trend["last2_down"],
+        "last3_up": trend["last3_up"],
+        "last3_down": trend["last3_down"],
+        "cross_count": trend["cross_count"],
+        "clean_body_count": trend["clean_body_count"],
+        "env_ok": trend["env_ok"],
+        "prev_candle_is_cross": prev_candle_is_cross,
+        "last_candle_is_cross": last_candle_is_cross,
+        "two_crosses": two_crosses,
+        "prepare_buy": prepare_buy,
+        "prepare_sell": prepare_sell,
+        "tracker_just_created": tracker_just_created,
+        "new_candle_started": new_candle_started,
+        "new_candle_direction_buy_ok": new_candle_direction_buy_ok,
+        "new_candle_direction_sell_ok": new_candle_direction_sell_ok,
+        "reaction_buy_ok": reaction_buy_ok,
+        "reaction_sell_ok": reaction_sell_ok,
+        "final_buy": final_buy,
+        "final_sell": final_sell,
+        "reason": ",".join(reason),
+        "snapshot": snapshot,
+        "forming": forming_out,
+    }
+
+STRATEGY_V1_SETUP_TRACKERS = {}
+STRATEGY_V1_ALERTS_ENABLED = True
+STRATEGY_V1_SENT_PREPARES = set()
+STRATEGY_V1_SENT_FINALS = set()
+STRATEGY_V1_SENT_MULTI = set()
+STRATEGY_V1_LAST_AUTO_SWITCH_TS = 0.0
+STRATEGY_V1_AUTO_SWITCH_COOLDOWN_SEC = 60.0
+
+
+def _strategy_v1__prepare_key(debug):
+    symbol = debug.get("symbol") or "?"
+    side = "BUY" if debug.get("prepare_buy") else ("SELL" if debug.get("prepare_sell") else "?")
+    last_ts = None
+    snap = debug.get("snapshot") or []
+    if snap:
+        last_ts = snap[-1].get("timestamp")
+    return f"{symbol}:{last_ts}:{side}"
+
+
+def _strategy_v1__send_prepare_if_needed():
+    debug = _strategy_v1__build_debug()
+
+    if not (debug.get("prepare_buy") or debug.get("prepare_sell")):
+        return {
+            "ok": True,
+            "sent": False,
+            "reason": "no_prepare_state",
+            "state": debug.get("state"),
+        }
+
+    prepare_key = _strategy_v1__prepare_key(debug)
+    if prepare_key in STRATEGY_V1_SENT_PREPARES:
+        return {
+            "ok": True,
+            "sent": False,
+            "reason": "already_sent",
+            "prepare_key": prepare_key,
+            "state": debug.get("state"),
+        }
+
+    side = "BUY" if debug.get("prepare_buy") else "SELL"
+    message = _tg_build_prepare_message(
+        symbol=str(debug.get("symbol") or "?"),
+        side=side,
+    )
+
+    result = _tg_send_message(
+        message,
+        reply_markup=_tg_signal_actions_markup(),
+    )
+    sent_ok = bool(result and result.get("ok"))
+
+    chart_result = {
+        "ok": False,
+        "sent": False,
+        "reason": "prepare_text_not_sent",
+    }
+
+    if sent_ok:
+        STRATEGY_V1_SENT_PREPARES.add(prepare_key)
+        try:
+            if "_tg_send_chart" in globals():
+                r = _tg_send_chart()
+                chart_result = {
+                    "ok": bool(r and r.get("ok")),
+                    "sent": bool(r and r.get("ok")),
+                    "result": r,
+                }
+            else:
+                chart_result = {
+                    "ok": False,
+                    "sent": False,
+                    "reason": "chart_helper_missing",
+                }
+        except Exception as e:
+            chart_result = {
+                "ok": False,
+                "sent": False,
+                "reason": f"{type(e).__name__}: {e}",
+            }
+
+    return {
+        "ok": True,
+        "sent": sent_ok,
+        "prepare_key": prepare_key,
+        "message": message,
+        "telegram_result": result,
+        "chart_result": chart_result,
+        "state": debug.get("state"),
+    }
+
+def _strategy_v1__final_key(debug):
+    symbol = debug.get("symbol") or "?"
+    side = "BUY" if debug.get("final_buy") else ("SELL" if debug.get("final_sell") else "?")
+    forming = debug.get("forming") or {}
+    ts = forming.get("timestamp") or "?"
+    return f"{symbol}:{ts}:{side}"
+
+
+def _strategy_v1__send_final_if_needed():
+    debug = _strategy_v1__build_debug()
+
+    if not (debug.get("final_buy") or debug.get("final_sell")):
+        return {
+            "ok": True,
+            "sent": False,
+            "reason": "no_final_state",
+            "state": debug.get("state"),
+        }
+
+    final_key = _strategy_v1__final_key(debug)
+    if final_key in STRATEGY_V1_SENT_FINALS:
+        return {
+            "ok": True,
+            "sent": False,
+            "reason": "already_sent",
+            "final_key": final_key,
+            "state": debug.get("state"),
+        }
+
+    side = "BUY" if debug.get("final_buy") else "SELL"
+    message = _tg_build_final_message(
+        symbol=str(debug.get("symbol") or "?"),
+        side=side,
+    )
+
+    result = _tg_send_message(
+        message,
+        reply_markup=_tg_signal_actions_markup(),
+    )
+    sent_ok = bool(result and result.get("ok"))
+
+    chart_result = {
+        "ok": False,
+        "sent": False,
+        "reason": "final_text_not_sent",
+    }
+
+    if sent_ok:
+        STRATEGY_V1_SENT_FINALS.add(final_key)
+        try:
+            if "_tg_send_chart" in globals():
+                r = _tg_send_chart()
+                chart_result = {
+                    "ok": bool(r and r.get("ok")),
+                    "sent": bool(r and r.get("ok")),
+                    "result": r,
+                }
+            else:
+                chart_result = {
+                    "ok": False,
+                    "sent": False,
+                    "reason": "chart_helper_missing",
+                }
+        except Exception as e:
+            chart_result = {
+                "ok": False,
+                "sent": False,
+                "reason": f"{type(e).__name__}: {e}",
+            }
+
+    return {
+        "ok": True,
+        "sent": sent_ok,
+        "final_key": final_key,
+        "message": message,
+        "telegram_result": result,
+        "chart_result": chart_result,
+        "state": debug.get("state"),
+    }
+
+STRATEGY_V1_AUTO_PREPARE_RUNNING = False
+
+
+def _strategy_v1__multi_signal_key(debug):
+    symbol = debug.get("symbol") or "?"
+    state = debug.get("state") or "?"
+    forming = debug.get("forming") or {}
+    snapshot = debug.get("snapshot") or []
+    ts = None
+    if forming and forming.get("timestamp"):
+        ts = forming.get("timestamp")
+    elif snapshot:
+        ts = snapshot[-1].get("timestamp")
+    else:
+        ts = "?"
+    return f"{symbol}:{state}:{ts}"
+
+
+SYMBOL_SWITCH_ASYNC_LOCK = None
+ENGINE_START_ASYNC_LOCK = None
+
+
+def _get_symbol_switch_async_lock():
+    global SYMBOL_SWITCH_ASYNC_LOCK
+    if SYMBOL_SWITCH_ASYNC_LOCK is None:
+        SYMBOL_SWITCH_ASYNC_LOCK = asyncio.Lock()
+    return SYMBOL_SWITCH_ASYNC_LOCK
+
+
+def _get_engine_start_async_lock():
+    global ENGINE_START_ASYNC_LOCK
+    if ENGINE_START_ASYNC_LOCK is None:
+        ENGINE_START_ASYNC_LOCK = asyncio.Lock()
+    return ENGINE_START_ASYNC_LOCK
+
+
+def _serialize_symbol_switch(fn):
+    @wraps(fn)
+    async def _wrapped(*args, **kwargs):
+        lock = _get_symbol_switch_async_lock()
+        async with lock:
+            return await fn(*args, **kwargs)
+    return _wrapped
+
+
+@_serialize_symbol_switch
+async def _strategy_v1__maybe_auto_switch_symbol():
+    global _tick_task, STRATEGY_V1_LAST_AUTO_SWITCH_TS
+
+    if getattr(STATE, "switch_mode", "MANUAL") != "AUTO":
+        return {
+            "ok": True,
+            "switched": False,
+            "reason": "manual_mode",
+            "active_symbol": STATE.symbol,
+            "switch_mode": STATE.switch_mode,
+        }
+
+    best = _strategy_v1__pick_best_symbol_candidate()
+    now = time.time()
+
+    if not best:
+        return {"ok": True, "switched": False, "reason": "no_candidate"}
+
+    target = best.get("symbol")
+    rank = int(best.get("rank") or 0)
+
+    if not target or target == STATE.symbol:
+        return {
+            "ok": True,
+            "switched": False,
+            "reason": "already_active_or_missing",
+            "best": best,
+        }
+
+    if rank <= 0:
+        return {
+            "ok": True,
+            "switched": False,
+            "reason": "rank_not_positive",
+            "best": best,
+        }
+
+    if (now - float(STRATEGY_V1_LAST_AUTO_SWITCH_TS or 0.0)) < STRATEGY_V1_AUTO_SWITCH_COOLDOWN_SEC:
+        return {
+            "ok": True,
+            "switched": False,
+            "reason": "cooldown",
+            "best": best,
+        }
+
+    old_symbol = STATE.symbol
+    STATE.symbol = target
+
+    ss = _get_symbol_state(target)
+    ss.stream_current = None
+    ss.stream_closed = []
+    ss.stream_age_sec = None
+    ss.active_mode = "HISTORY"
+
+    STATE.stream_current = None
+    STATE.stream_closed = []
+    STATE.stream_age_sec = None
+    STATE.active_mode = "HISTORY"
+
+    tf = STATE.tick_feed
+    tf.last_tick_event = None
+    tf.last_tick_ts_raw = None
+    tf.last_tick_ts_used = None
+    tf.last_tick_local_ts = None
+    tf.last_tick_age_sec = None
+    tf.last_price = None
+    tf.warmup_active = False
+    tf.warmup_until_open_ts = None
+    tf.warmup_note = "auto_switch_reset"
+    tf.asset_id_for_symbol = None
+
+    if _tick_task is not None:
+        _tick_task.cancel()
+        try:
+            await asyncio.gather(_tick_task, return_exceptions=True)
+        except Exception:
+            pass
+        _tick_task = None
+
+    if PO_USE_PW:
+        STATE.wd_engine_start_ts = time.time()
+        _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+
+    STRATEGY_V1_LAST_AUTO_SWITCH_TS = now
+
+    try:
+        _update_hybrid_choice()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "switched": True,
+        "old_symbol": old_symbol,
+        "active_symbol": STATE.symbol,
+        "best": best,
+    }
+
+
+def _strategy_v1__scan_and_send_multi_signals():
+    old_symbol = STATE.symbol
+    results = []
+
+    try:
+        for sym in list(getattr(STATE, "symbols", []) or []):
+            debug = _strategy_v1__build_debug_for_symbol(sym)
+            state = debug.get("state") or ""
+
+            is_prepare = state in ("PREPARE_BUY", "PREPARE_SELL")
+            is_final = state in ("FINAL_BUY", "FINAL_SELL")
+
+            if not (is_prepare or is_final):
+                results.append({
+                    "symbol": sym,
+                    "sent": False,
+                    "reason": "no_signal_state",
+                    "state": state,
+                })
+                continue
+
+            msg_key = _strategy_v1__multi_signal_key(debug)
+            if msg_key in STRATEGY_V1_SENT_MULTI:
+                results.append({
+                    "symbol": sym,
+                    "sent": False,
+                    "reason": "already_sent",
+                    "state": state,
+                    "key": msg_key,
+                })
+                continue
+
+            side = "BUY" if ("BUY" in state) else "SELL"
+            header = "FINAL" if is_final else "PREPARE"
+
+            ts_text = "?"
+            forming = debug.get("forming") or {}
+            snapshot = debug.get("snapshot") or []
+            if is_final and forming:
+                ts_text = forming.get("open_time") or str(forming.get("timestamp") or "?")
+            elif snapshot:
+                ts_text = snapshot[-1].get("open_time") or str(snapshot[-1].get("timestamp") or "?")
+
+            message = f"{header}\n{sym}\n{side}\n{ts_text}"
+            result = _telegram_send_text(message)
+            sent_ok = bool(result and result.get("ok"))
+
+            if sent_ok:
+                STRATEGY_V1_SENT_MULTI.add(msg_key)
+
+            results.append({
+                "symbol": sym,
+                "sent": sent_ok,
+                "state": state,
+                "key": msg_key,
+                "message": message,
+                "telegram_result": result,
+            })
+
+        return {
+            "ok": True,
+            "items": results,
+        }
+    finally:
+        STATE.symbol = old_symbol
+
+
+async def _strategy_v1__auto_prepare_tick():
+    try:
+        switch_result = {"ok": True, "switched": False, "reason": "temporarily_disabled"}
+        prepare_result = _strategy_v1__send_prepare_if_needed()
+        final_result = _strategy_v1__send_final_if_needed()
+        multi_result = _strategy_v1__scan_and_send_multi_signals()
+        return {
+            "ok": True,
+            "switch": switch_result,
+            "prepare": prepare_result,
+            "final": final_result,
+            "multi": multi_result,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"auto_prepare_tick_failed: {e}",
+        }
+
+
+def _strategy_v1__auto_prepare_loop():
+    global STRATEGY_V1_AUTO_PREPARE_RUNNING
+    if STRATEGY_V1_AUTO_PREPARE_RUNNING:
+        return
+    STRATEGY_V1_AUTO_PREPARE_RUNNING = True
+
+    def _runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        while True:
+            try:
+                loop.run_until_complete(_strategy_v1__auto_prepare_tick())
+            except Exception:
+                pass
+            time.sleep(1)
+
+    t = threading.Thread(target=_runner, name="strategy-v1-auto-prepare", daemon=True)
+    t.start()
+
+
+@app.on_event("startup")
+def _strategy_v1__startup_auto_prepare():
+    _strategy_v1__auto_prepare_loop()
+
+def _strategy_v1__build_debug_for_symbol(symbol: str):
+    old_symbol = STATE.symbol
+    old_active_mode = getattr(STATE, "active_mode", None)
+    old_stream_current = getattr(STATE, "stream_current", None)
+    old_stream_closed = list(getattr(STATE, "stream_closed", []) or [])
+    old_stream_age_sec = getattr(STATE, "stream_age_sec", None)
+
+    try:
+        STATE.symbol = symbol
+        ss = _get_symbol_state(symbol)
+
+        has_stream_data = bool(getattr(ss, "stream_current", None)) or bool(getattr(ss, "stream_closed", []) or [])
+        if has_stream_data:
+            ss.active_mode = "STREAM"
+        else:
+            ss.active_mode = "HISTORY"
+
+        STATE.stream_current = getattr(ss, "stream_current", None)
+        STATE.stream_closed = list(getattr(ss, "stream_closed", []) or [])
+        STATE.stream_age_sec = getattr(ss, "stream_age_sec", None)
+        STATE.active_mode = getattr(ss, "active_mode", "HISTORY")
+
+        return _strategy_v1__build_debug()
+    finally:
+        STATE.symbol = old_symbol
+        STATE.active_mode = old_active_mode
+        STATE.stream_current = old_stream_current
+        STATE.stream_closed = old_stream_closed
+        STATE.stream_age_sec = old_stream_age_sec
+
+
+@app.get("/api/strategy/debug_all_symbols")
+def api_strategy_debug_all_symbols():
+    old_symbol = STATE.symbol
+    old_active_mode = STATE.active_mode
+    old_stream_current = STATE.stream_current
+    old_stream_closed = list(getattr(STATE, "stream_closed", []) or [])
+    old_stream_age_sec = STATE.stream_age_sec
+    items = []
+    try:
+        for sym in list(getattr(STATE, "symbols", []) or []):
+            data = _strategy_v1__build_debug_for_symbol(sym)
+            items.append({
+                "symbol": sym,
+                "is_active": sym == old_symbol,
+                "active_mode": data.get("active_mode"),
+                "state": data.get("state"),
+                "market_state_main": data.get("market_state_main"),
+                "market_state_main_reason": data.get("market_state_main_reason"),
+                "market_bias": data.get("market_bias"),
+                "market_bias_reason": data.get("market_bias_reason"),
+                "market_bias_windows": data.get("market_bias_windows"),
+                "local_state": data.get("local_state"),
+                "local_state_reason": data.get("local_state_reason"),
+                "market_state_v2": data.get("market_state_v2"),
+                "market_state_v2_reason": data.get("market_state_v2_reason"),
+                "prev_candle_is_cross": data.get("prev_candle_is_cross"),
+                "last_candle_is_cross": data.get("last_candle_is_cross"),
+                "two_crosses": data.get("two_crosses"),
+                "prepare_buy": data.get("prepare_buy"),
+                "prepare_sell": data.get("prepare_sell"),
+                "tracker_just_created": data.get("tracker_just_created"),
+                "final_buy": data.get("final_buy"),
+                "final_sell": data.get("final_sell"),
+                "reason": data.get("reason"),
+                "up_count": data.get("up_count"),
+                "down_count": data.get("down_count"),
+                "alternations": data.get("alternations"),
+                "cross_count": data.get("cross_count"),
+                "clean_body_count": data.get("clean_body_count"),
+                "env_ok": data.get("env_ok"),
+                "net_ha_move": data.get("net_ha_move"),
+                "last2_up": data.get("last2_up"),
+                "last2_down": data.get("last2_down"),
+                "last3_up": data.get("last3_up"),
+                "last3_down": data.get("last3_down"),
+            })
+        return {
+            "ok": True,
+            "active_symbol": old_symbol,
+            "items": items,
+        }
+    finally:
+        STATE.symbol = old_symbol
+        STATE.active_mode = old_active_mode
+        STATE.stream_current = old_stream_current
+        STATE.stream_closed = old_stream_closed
+        STATE.stream_age_sec = old_stream_age_sec
+
+
+@app.get("/api/strategy/signals_scan")
+def api_strategy_signals_scan():
+    old_symbol = STATE.symbol
+    old_active_mode = STATE.active_mode
+    old_stream_current = STATE.stream_current
+    old_stream_closed = list(getattr(STATE, "stream_closed", []) or [])
+    old_stream_age_sec = STATE.stream_age_sec
+    items = []
+    try:
+        for sym in list(getattr(STATE, "symbols", []) or []):
+            data = _strategy_v1__build_debug_for_symbol(sym)
+            state = data.get("state")
+            if data.get("final_buy") or data.get("final_sell") or data.get("prepare_buy") or data.get("prepare_sell") or not data.get("chaos"):
+                items.append({
+                    "symbol": sym,
+                    "state": state,
+                    "prepare_buy": data.get("prepare_buy"),
+                    "prepare_sell": data.get("prepare_sell"),
+                    "final_buy": data.get("final_buy"),
+                    "final_sell": data.get("final_sell"),
+                    "trend_buy": data.get("trend_buy"),
+                    "trend_sell": data.get("trend_sell"),
+                    "chaos": data.get("chaos"),
+                })
+        return {
+            "ok": True,
+            "active_symbol": old_symbol,
+            "count": len(items),
+            "items": items,
+        }
+    finally:
+        STATE.symbol = old_symbol
+        STATE.active_mode = old_active_mode
+        STATE.stream_current = old_stream_current
+        STATE.stream_closed = old_stream_closed
+        STATE.stream_age_sec = old_stream_age_sec
+
+
+def _strategy_v1__candidate_rank(data):
+    state = data.get("state") or ""
+    if state.startswith("FINAL_"):
+        return 100
+    if state.startswith("PREPARE_"):
+        return 90
+    if state in ("BUY_WAITING_REACTION", "SELL_WAITING_REACTION"):
+        return 80
+    if state in ("BUY_WAITING_NEW_CANDLE", "SELL_WAITING_NEW_CANDLE"):
+        return 70
+    if state in ("BUY_TREND_NO_CROSSES", "SELL_TREND_NO_CROSSES"):
+        return 60
+    if not data.get("chaos"):
+        return 50
+    return 0
+
+
+def _strategy_v1__pick_best_symbol_candidate():
+    old_symbol = STATE.symbol
+    best = None
+
+    try:
+        for sym in list(getattr(STATE, "symbols", []) or []):
+            data = _strategy_v1__build_debug_for_symbol(sym)
+            rank = _strategy_v1__candidate_rank(data)
+
+            row = {
+                "symbol": sym,
+                "rank": rank,
+                "state": data.get("state"),
+                "trend_buy": data.get("trend_buy"),
+                "trend_sell": data.get("trend_sell"),
+                "chaos": data.get("chaos"),
+                "prepare_buy": data.get("prepare_buy"),
+                "prepare_sell": data.get("prepare_sell"),
+                "final_buy": data.get("final_buy"),
+                "final_sell": data.get("final_sell"),
+            }
+
+            if best is None or row["rank"] > best["rank"]:
+                best = row
+
+        return best
+    finally:
+        STATE.symbol = old_symbol
+
+
+@app.get("/api/strategy/best_symbol_candidate")
+def api_strategy_best_symbol_candidate():
+    best = _strategy_v1__pick_best_symbol_candidate()
+    return {
+        "ok": True,
+        "active_symbol": STATE.symbol,
+        "best": best,
+        "would_switch": bool(best and best.get("symbol") and best.get("symbol") != STATE.symbol and int(best.get("rank") or 0) > 0),
+    }
+
+
+@app.get("/api/switch_mode")
+def api_switch_mode():
+    return {
+        "ok": True,
+        "switch_mode": STATE.switch_mode,
+        "active_symbol": STATE.symbol,
+    }
+
+
+@app.post("/api/switch_mode")
+def api_set_switch_mode(mode: str):
+    mode = str(mode or "").upper().strip()
+    if mode not in ("AUTO", "MANUAL"):
+        return {
+            "ok": False,
+            "error": "invalid_mode",
+            "allowed": ["AUTO", "MANUAL"],
+        }
+
+    STATE.switch_mode = mode
+    return {
+        "ok": True,
+        "switch_mode": STATE.switch_mode,
+        "active_symbol": STATE.symbol,
+    }
+
+
+@app.get("/api/strategy/alerts")
+def api_strategy_alerts():
+    return {
+        "ok": True,
+        "alerts_enabled": bool(STRATEGY_V1_ALERTS_ENABLED),
+    }
+
+
+@app.post("/api/strategy/alerts")
+def api_strategy_alerts_set(enabled: bool):
+    global STRATEGY_V1_ALERTS_ENABLED
+    STRATEGY_V1_ALERTS_ENABLED = bool(enabled)
+    return {
+        "ok": True,
+        "alerts_enabled": bool(STRATEGY_V1_ALERTS_ENABLED),
+    }
+
+
+@app.post("/api/symbols/switch")
+@_serialize_symbol_switch
+async def api_symbols_switch(symbol: str):
+    global _tick_task
+
+    symbols = list(getattr(STATE, "symbols", []) or [])
+    if symbol not in symbols:
+        return {
+            "ok": False,
+            "error": "invalid_symbol",
+            "requested_symbol": symbol,
+            "allowed_symbols": symbols,
+        }
+
+    old_symbol = STATE.symbol
+    STATE.symbol = symbol
+
+    ss = _get_symbol_state(symbol)
+
+    has_stream_data = bool(getattr(ss, "stream_current", None)) or bool(getattr(ss, "stream_closed", []) or [])
+    if has_stream_data:
+        ss.active_mode = "STREAM"
+    else:
+        ss.active_mode = "HISTORY"
+
+    STATE.stream_current = getattr(ss, "stream_current", None)
+    STATE.stream_closed = list(getattr(ss, "stream_closed", []) or [])
+    STATE.stream_age_sec = getattr(ss, "stream_age_sec", None)
+    STATE.active_mode = getattr(ss, "active_mode", "HISTORY")
+
+    tf = STATE.tick_feed
+    tf.last_tick_event = None
+    tf.last_tick_ts_raw = None
+    tf.last_tick_ts_used = None
+    tf.last_tick_local_ts = None
+    tf.last_tick_age_sec = None
+    tf.last_price = None
+    tf.warmup_active = False
+    tf.warmup_until_open_ts = None
+    tf.warmup_note = "switch_reset"
+    tf.asset_id_for_symbol = None
+    tf.pending_event = None
+    tf.frames_tail = []
+
+    ui_switch_result = None
+    did_restart_tick_feed = False
+
+    if PO_USE_PW and _PW_PAGE is not None:
+        try:
+            ui_switch_result = await _pw_switch_symbol_ui(symbol)
+        except Exception as e:
+            ui_switch_result = {"ok": False, "error": f"{type(e).__name__}: {e}", "symbol": symbol}
+
+    if PO_USE_PW and not (ui_switch_result and ui_switch_result.get("ok")):
+        if _tick_task is not None:
+            _tick_task.cancel()
+            try:
+                await asyncio.gather(_tick_task, return_exceptions=True)
+            except Exception:
+                pass
+            _tick_task = None
+
+        STATE.wd_engine_start_ts = time.time()
+        _tick_task = asyncio.create_task(_tick_feed_playwright_ws())
+        did_restart_tick_feed = True
+        await asyncio.sleep(4.0)
+
+        try:
+            ui_switch_result = await _pw_switch_symbol_ui(symbol)
+        except Exception as e:
+            ui_switch_result = {"ok": False, "error": f"{type(e).__name__}: {e}", "symbol": symbol}
+
+    try:
+        _update_hybrid_choice()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "old_symbol": old_symbol,
+        "active_symbol": STATE.symbol,
+        "tick_feed_restarted": did_restart_tick_feed if PO_USE_PW else False,
+        "ui_switch_result": ui_switch_result,
+    }
+
+
+@app.get("/api/assets/search")
+def api_assets_search(q: str = ""):
+    qn = (q or "").strip().lower()
+    items = []
+    for aid, name in sorted((_ASSET_ID_TO_SYMBOL or {}).items(), key=lambda x: str(x[1])):
+        text = str(name)
+        if not qn or qn in text.lower():
+            items.append({"asset_id": aid, "symbol": text})
+    return {"ok": True, "query": q, "count": len(items), "items": items[:200]}
+
+
+@app.get("/api/symbols/history_one")
+async def api_symbols_history_one(symbol: str, limit: int = 20):
+    ssid = _read_ssid()
+    if not ssid:
+        return {"ok": False, "error": "Missing SSID", "symbol": symbol}
+
+    try:
+        client = AsyncPocketOptionClient(ssid=ssid, is_demo=STATE.is_demo, enable_logging=False)
+        await client.connect()
+        items = await _fetch_history_closed(client, limit=limit, symbol=symbol)
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "count": len(items),
+            "first_open_time": items[0]["open_time"] if items else None,
+            "last_open_time": items[-1]["open_time"] if items else None,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "error": f"{type(e).__name__}: {e}",
+        }
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
+def _last_n__item_to_dict(item):
+    if isinstance(item, dict):
+        return item
+
+    if hasattr(item, "model_dump"):
+        try:
+            return item.model_dump()
+        except Exception:
+            pass
+
+    if hasattr(item, "dict"):
+        try:
+            return item.dict()
+        except Exception:
+            pass
+
+    data = {}
+    for key in (
+        "symbol",
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "source",
+        "open_time",
+        "close_time",
+        "age_sec",
+        "ha_open",
+        "ha_high",
+        "ha_low",
+        "ha_close",
+        "ha_dir",
+        "ha_seeded",
+    ):
+        if hasattr(item, key):
+            try:
+                data[key] = getattr(item, key)
+            except Exception:
+                pass
+
+    if data:
+        return data
+
+    return {"value": str(item)}
+
+
+def _last_n__looks_like_candle(item):
+    d = _last_n__item_to_dict(item)
+    return isinstance(d, dict) and all(k in d for k in ("timestamp", "open", "high", "low", "close"))
+
+
+def _last_n__to_list(obj):
+    if isinstance(obj, (list, tuple)):
+        return list(obj)
+
+    if type(obj).__name__ == "deque":
+        try:
+            return list(obj)
+        except Exception:
+            return []
+
+    return []
+
+
+def _last_n__pick_store(closed=1):
+    preferred_closed = [
+        "stream_closed",
+        "stream_closed_candles",
+        "candles_closed",
+        "closed_candles",
+        "closed_bars",
+        "bars_closed",
+        "minute_closed",
+        "stream_history",
+    ]
+
+    preferred_all = [
+        "stream_candles",
+        "candles_all",
+        "all_candles",
+        "candles",
+        "bars",
+        "stream_live",
+        "live_candles",
+        "minute_candles",
+        "stream_history",
+        "stream_closed",
+        "candles_closed",
+        "closed_candles",
+    ]
+
+    names = preferred_closed if int(closed) == 1 else preferred_all
+
+    for name in names:
+        if name in globals():
+            seq = _last_n__to_list(globals()[name])
+            if seq and _last_n__looks_like_candle(seq[-1]):
+                return name, seq
+
+    candidates = []
+    for name, obj in globals().items():
+        if name.startswith("_"):
+            continue
+
+        seq = _last_n__to_list(obj)
+        if not seq:
+            continue
+
+        try:
+            sample = seq[-1]
+        except Exception:
+            continue
+
+        if not _last_n__looks_like_candle(sample):
+            continue
+
+        lname = name.lower()
+        score = 0
+
+        if "candle" in lname:
+            score += 20
+        if "bar" in lname:
+            score += 10
+        if "stream" in lname:
+            score += 12
+        if "history" in lname or "buffer" in lname:
+            score += 8
+
+        if int(closed) == 1:
+            if "closed" in lname:
+                score += 50
+            if "live" in lname or "open" in lname or "current" in lname:
+                score -= 30
+        else:
+            if "live" in lname or "open" in lname or "current" in lname or "all" in lname:
+                score += 30
+            if "closed" in lname:
+                score += 5
+
+        score += min(len(seq), 500) / 1000.0
+        candidates.append((score, name, seq))
+
+    if not candidates:
+        return None, []
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, name, seq = candidates[0]
+    return name, seq
+
+
+
+
+@app.get("/api/last_n")
+def api_last_n(
+    n: int = Query(50, ge=1, le=500),
+    closed: int = Query(1)
+):
+    def _to_dict(x):
+        if isinstance(x, dict):
+            return dict(x)
+        if hasattr(x, "model_dump"):
+            try:
+                return dict(x.model_dump())
+            except Exception:
+                pass
+        if hasattr(x, "dict"):
+            try:
+                return dict(x.dict())
+            except Exception:
+                pass
+        return {"value": str(x)}
+
+    def _calc_ha(items):
+        out = []
+        prev_ha_open = None
+        prev_ha_close = None
+
+        for raw in items:
+            c = _to_dict(raw)
+
+            if not all(k in c for k in ("open", "high", "low", "close")):
+                out.append(c)
+                continue
+
+            o = float(c["open"])
+            h = float(c["high"])
+            l = float(c["low"])
+            cl = float(c["close"])
+
+            ha_close = (o + h + l + cl) / 4.0
+
+            if prev_ha_open is None or prev_ha_close is None:
+                ha_open = (o + cl) / 2.0
+            else:
+                ha_open = (prev_ha_open + prev_ha_close) / 2.0
+
+            ha_high = max(h, ha_open, ha_close)
+            ha_low = min(l, ha_open, ha_close)
+            ha_dir = "UP" if ha_close >= ha_open else "DOWN"
+
+            c["ha_open"] = ha_open
+            c["ha_high"] = ha_high
+            c["ha_low"] = ha_low
+            c["ha_close"] = ha_close
+            c["ha_dir"] = ha_dir
+            c["ha_seeded"] = True
+
+            prev_ha_open = ha_open
+            prev_ha_close = ha_close
+            out.append(c)
+
+        return out
+
+    items = []
+    store_name = None
+    ss = _get_symbol_state(STATE.symbol)
+
+    if int(closed) == 1:
+        stream_items = list(getattr(ss, "stream_closed", []) or [])
+        history_items = list(getattr(ss, "history_closed", []) or [])
+
+        if getattr(ss, "active_mode", None) == "STREAM":
+            if len(stream_items) >= n:
+                items = stream_items
+                store_name = "ss.stream_closed"
+            elif stream_items and history_items:
+                need = max(0, n - len(stream_items))
+                hist_part = history_items[-need:] if need > 0 else []
+                combined = hist_part + stream_items
+
+                dedup = []
+                seen = set()
+                for x in combined:
+                    ts = None
+                    if isinstance(x, dict):
+                        ts = x.get("timestamp")
+                    if ts in seen:
+                        continue
+                    seen.add(ts)
+                    dedup.append(x)
+
+                items = dedup
+                store_name = "ss.history_closed + ss.stream_closed"
+            elif stream_items:
+                items = stream_items
+                store_name = "ss.stream_closed"
+            else:
+                items = history_items
+                store_name = "ss.history_closed"
+        else:
+            items = history_items
+            store_name = "ss.history_closed"
+
+        if not items:
+            items = history_items
+            store_name = "ss.history_closed"
+    else:
+        current = getattr(ss, "stream_current", None)
+        closed_items = list(getattr(ss, "stream_closed", []) or [])
+
+        if current is not None:
+            items = closed_items + [current]
+            store_name = "ss.stream_closed + ss.stream_current"
+        else:
+            items = closed_items
+            store_name = "ss.stream_closed"
+
+        if not items:
+            items = list(getattr(ss, "history_closed", []) or [])
+            store_name = "ss.history_closed"
+
+    out = _calc_ha(items)[-n:]
+
+    return {
+        "ok": True,
+        "closed": bool(closed),
+        "count": len(out),
+        "items": out,
+        "store": store_name,
+        "active_mode": _effective_active_mode_for_symbol(getattr(STATE, "symbol", None)),
+    }
+
+
+
+DB_DIR = Path("data")
+DB_PATH = DB_DIR / "bot.db"
+
+
+def _sqlite_connect_v1():
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _sqlite_init_v1():
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+
+    conn = _sqlite_connect_v1()
+    try:
+        cur = conn.cursor()
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_key TEXT UNIQUE,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL DEFAULT 'M1',
+            candle_ts INTEGER NOT NULL,
+            signal_time TEXT,
+            side TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'new',
+            is_informational INTEGER NOT NULL DEFAULT 0,
+            expires_at_ts INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER,
+            symbol TEXT NOT NULL,
+            entry_decision TEXT NOT NULL DEFAULT 'pending',
+            result TEXT NOT NULL DEFAULT '',
+            entered_at TEXT,
+            closed_at TEXT,
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(signal_id) REFERENCES signals(id)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_ts ON signals(symbol, candle_ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_signal_id ON trades(signal_id)")
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+def _sqlite_startup_init_v1():
+    _sqlite_init_v1()
+
+
+@app.get("/api/db_status")
+def api_db_status():
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    exists = DB_PATH.exists()
+    size = DB_PATH.stat().st_size if exists else 0
+
+    tables = []
+    if exists:
+        conn = _sqlite_connect_v1()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table'
+                ORDER BY name
+            """)
+            tables = [row[0] for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    return {
+        "ok": True,
+        "db_path": str(DB_PATH),
+        "exists": exists,
+        "size": size,
+        "tables": tables,
+    }
+
+
+def _db_execute(sql, params=()):
+    conn = _sqlite_connect_v1()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def _db_fetchall(sql, params=()):
+    conn = _sqlite_connect_v1()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _db_fetchone(sql, params=()):
+    conn = _sqlite_connect_v1()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _make_signal_key(symbol, candle_ts, side):
+    return f"{symbol}:{candle_ts}:{side}"
+
+
+@app.post("/api/signals/create_test")
+def api_signals_create_test():
+    last = None
+
+    try:
+        if getattr(STATE, "stream_closed", None):
+            if len(STATE.stream_closed) > 0:
+                last = STATE.stream_closed[-1]
+    except Exception:
+        last = None
+
+    if not last:
+        try:
+            if getattr(STATE, "history_closed", None):
+                if len(STATE.history_closed) > 0:
+                    last = STATE.history_closed[-1]
+        except Exception:
+            last = None
+
+    if not last:
+        return {
+            "ok": False,
+            "error": "no_closed_candle_available"
+        }
+
+    symbol = last.get("symbol") or getattr(STATE, "symbol", "UNKNOWN")
+    candle_ts = int(last.get("timestamp"))
+    side = "BUY" if (last.get("ha_dir") == "UP") else "SELL"
+    reason = "TEST_SIGNAL"
+    signal_key = _make_signal_key(symbol, candle_ts, side)
+    expires_at_ts = candle_ts + 60
+
+    existing = _db_fetchone(
+        "SELECT * FROM signals WHERE signal_key = ?",
+        (signal_key,)
+    )
+    if existing:
+        return {
+            "ok": True,
+            "created": False,
+            "signal": existing
+        }
+
+    signal_id = _db_execute(
+        """
+        INSERT INTO signals (
+            signal_key,
+            symbol,
+            timeframe,
+            candle_ts,
+            signal_time,
+            side,
+            reason,
+            status,
+            is_informational,
+            expires_at_ts
+        )
+        VALUES (?, ?, 'M1', ?, datetime('now'), ?, ?, 'new', 0, ?)
+        """,
+        (
+            signal_key,
+            symbol,
+            candle_ts,
+            side,
+            reason,
+            expires_at_ts
+        )
+    )
+
+    row = _db_fetchone(
+        "SELECT * FROM signals WHERE id = ?",
+        (signal_id,)
+    )
+
+    return {
+        "ok": True,
+        "created": True,
+        "signal": row
+    }
+
+
+@app.get("/api/signals")
+def api_signals(limit: int = Query(20, ge=1, le=200)):
+    rows = _db_fetchall(
+        """
+        SELECT *
+        FROM signals
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+@app.get("/api/signals/last")
+def api_signals_last():
+    row = _db_fetchone(
+        """
+        SELECT *
+        FROM signals
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+    return {
+        "ok": True,
+        "item": row
+    }
+
+
+def _db_execute_update(sql, params=()):
+    conn = _sqlite_connect_v1()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def _get_signal_by_id(signal_id: int):
+    return _db_fetchone(
+        "SELECT * FROM signals WHERE id = ?",
+        (signal_id,)
+    )
+
+
+def _get_trade_by_signal_id(signal_id: int):
+    return _db_fetchone(
+        "SELECT * FROM trades WHERE signal_id = ? ORDER BY id DESC LIMIT 1",
+        (signal_id,)
+    )
+
+
+def _upsert_trade_decision(signal_row, decision: str):
+    signal_id = int(signal_row["id"])
+    symbol = signal_row["symbol"]
+
+    existing_trade = _get_trade_by_signal_id(signal_id)
+
+    if existing_trade:
+        _db_execute_update(
+            """
+            UPDATE trades
+            SET entry_decision = ?,
+                entered_at = CASE
+                    WHEN ? = 'taken' THEN datetime('now')
+                    ELSE entered_at
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE signal_id = ?
+            """,
+            (decision, decision, signal_id)
+        )
+    else:
+        _db_execute(
+            """
+            INSERT INTO trades (
+                signal_id,
+                symbol,
+                entry_decision,
+                result,
+                entered_at,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                ?, ?, ?, '',
+                CASE WHEN ? = 'taken' THEN datetime('now') ELSE NULL END,
+                CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP
+            )
+            """,
+            (signal_id, symbol, decision, decision)
+        )
+
+    return _get_trade_by_signal_id(signal_id)
+
+
+@app.post("/api/signals/{signal_id}/take")
+def api_signal_take(signal_id: int):
+    signal_row = _get_signal_by_id(signal_id)
+    if not signal_row:
+        return {
+            "ok": False,
+            "error": "signal_not_found",
+            "signal_id": signal_id
+        }
+
+    _db_execute_update(
+        """
+        UPDATE signals
+        SET status = 'taken',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (signal_id,)
+    )
+
+    signal_row = _get_signal_by_id(signal_id)
+    trade_row = _upsert_trade_decision(signal_row, "taken")
+
+    return {
+        "ok": True,
+        "action": "take",
+        "signal": signal_row,
+        "trade": trade_row
+    }
+
+
+@app.post("/api/signals/{signal_id}/skip")
+def api_signal_skip(signal_id: int):
+    signal_row = _get_signal_by_id(signal_id)
+    if not signal_row:
+        return {
+            "ok": False,
+            "error": "signal_not_found",
+            "signal_id": signal_id
+        }
+
+    _db_execute_update(
+        """
+        UPDATE signals
+        SET status = 'skipped',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (signal_id,)
+    )
+
+    signal_row = _get_signal_by_id(signal_id)
+    trade_row = _upsert_trade_decision(signal_row, "skipped")
+
+    return {
+        "ok": True,
+        "action": "skip",
+        "signal": signal_row,
+        "trade": trade_row
+    }
+
+
+@app.get("/api/trades")
+def api_trades(limit: int = Query(20, ge=1, le=200)):
+    rows = _db_fetchall(
+        """
+        SELECT *
+        FROM trades
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": rows
+    }
+
+
+def _set_trade_result(signal_id: int, result_value: str):
+    trade_row = _get_trade_by_signal_id(signal_id)
+
+    if trade_row:
+        _db_execute_update(
+            """
+            UPDATE trades
+            SET result = ?,
+                closed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE signal_id = ?
+            """,
+            (result_value, signal_id)
+        )
+    else:
+        signal_row = _get_signal_by_id(signal_id)
+        if not signal_row:
+            return None
+
+        _db_execute(
+            """
+            INSERT INTO trades (
+                signal_id,
+                symbol,
+                entry_decision,
+                result,
+                entered_at,
+                closed_at,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                ?, ?, 'taken', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """,
+            (signal_id, signal_row["symbol"], result_value)
+        )
+
+    return _get_trade_by_signal_id(signal_id)
+
+
+@app.post("/api/signals/{signal_id}/win")
+def api_signal_win(signal_id: int):
+    signal_row = _get_signal_by_id(signal_id)
+    if not signal_row:
+        return {
+            "ok": False,
+            "error": "signal_not_found",
+            "signal_id": signal_id
+        }
+
+    _db_execute_update(
+        """
+        UPDATE signals
+        SET status = 'win',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (signal_id,)
+    )
+
+    signal_row = _get_signal_by_id(signal_id)
+    trade_row = _set_trade_result(signal_id, "WIN")
+    telegram_result = _tg_send_trade_result_if_ready(signal_row, "WIN")
+
+    return {
+        "ok": True,
+        "action": "win",
+        "signal": signal_row,
+        "trade": trade_row,
+        "telegram": telegram_result
+    }
+
+
+@app.post("/api/signals/{signal_id}/loss")
+def api_signal_loss(signal_id: int):
+    signal_row = _get_signal_by_id(signal_id)
+    if not signal_row:
+        return {
+            "ok": False,
+            "error": "signal_not_found",
+            "signal_id": signal_id
+        }
+
+    _db_execute_update(
+        """
+        UPDATE signals
+        SET status = 'loss',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (signal_id,)
+    )
+
+    signal_row = _get_signal_by_id(signal_id)
+    trade_row = _set_trade_result(signal_id, "LOSS")
+    telegram_result = _tg_send_trade_result_if_ready(signal_row, "LOSS")
+
+    return {
+        "ok": True,
+        "action": "loss",
+        "signal": signal_row,
+        "trade": trade_row,
+        "telegram": telegram_result
+    }
+
+
+@app.get("/api/stats")
+def api_stats():
+    signals_total_row = _db_fetchone("SELECT COUNT(*) AS n FROM signals")
+    trades_total_row = _db_fetchone("SELECT COUNT(*) AS n FROM trades")
+
+    by_status_rows = _db_fetchall(
+        """
+        SELECT status, COUNT(*) AS n
+        FROM signals
+        GROUP BY status
+        ORDER BY status
+        """
+    )
+
+    trade_result_rows = _db_fetchall(
+        """
+        SELECT result, COUNT(*) AS n
+        FROM trades
+        GROUP BY result
+        ORDER BY result
+        """
+    )
+
+    signals_total = int((signals_total_row or {}).get("n", 0) or 0)
+    trades_total = int((trades_total_row or {}).get("n", 0) or 0)
+
+    status_map = {
+        "new": 0,
+        "taken": 0,
+        "skipped": 0,
+        "win": 0,
+        "loss": 0,
+    }
+
+    for row in by_status_rows:
+        key = row.get("status")
+        val = int(row.get("n", 0) or 0)
+        status_map[key] = val
+
+    result_map = {
+        "WIN": 0,
+        "LOSS": 0,
+        "": 0,
+    }
+
+    for row in trade_result_rows:
+        key = row.get("result")
+        val = int(row.get("n", 0) or 0)
+        result_map[key] = val
+
+    wins = int(result_map.get("WIN", 0) or 0)
+    losses = int(result_map.get("LOSS", 0) or 0)
+    decided = wins + losses
+    winrate = round((wins / decided) * 100.0, 2) if decided > 0 else 0.0
+
+    return {
+        "ok": True,
+        "signals_total": signals_total,
+        "trades_total": trades_total,
+        "signals": status_map,
+        "results": {
+            "win": wins,
+            "loss": losses,
+            "decided": decided,
+            "winrate": winrate,
+        },
+    }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return """
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bot Dashboard</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #0b1220;
+      color: #e5e7eb;
+      margin: 0;
+      padding: 16px;
+    }
+    h1, h2, h3 { margin: 0 0 12px 0; }
+    .wrap {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.25);
+    }
+    .muted { color: #9ca3af; }
+    .ok { color: #34d399; }
+    .bad { color: #f87171; }
+    .warn { color: #fbbf24; }
+    .mono { font-family: Menlo, Monaco, monospace; }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 6px 0;
+      border-bottom: 1px solid #1f2937;
+    }
+    .row:last-child { border-bottom: none; }
+    .buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      background: #2563eb;
+      color: white;
+      border: none;
+      border-radius: 10px;
+      padding: 10px 12px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    button:hover { opacity: 0.92; }
+    button.gray { background: #4b5563; }
+    button.green { background: #059669; }
+    button.red { background: #dc2626; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      border-bottom: 1px solid #1f2937;
+      padding: 8px 6px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { color: #9ca3af; }
+    .pill {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: #1f2937;
+    }
+    .pill.up { color: #34d399; }
+    .pill.down { color: #f87171; }
+    .statusline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 14px;
+    }
+    .small { font-size: 12px; }
+    .symbol-mini-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .symbol-mini-card {
+      background: #0b1730;
+      border: 1px solid #1f2c46;
+      border-radius: 16px;
+      padding: 14px;
+      min-height: 118px;
+    }
+    .symbol-mini-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .symbol-mini-right {
+      text-align: right;
+    }
+    .symbol-mini-name {
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .symbol-mini-bottom {
+      margin-top: 12px;
+    }
+    .state-badge {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.2px;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }
+    .state-chaos {
+      background: #1f2937;
+      color: #d1d5db;
+      border-color: #374151;
+    }
+    .state-build-buy {
+      background: rgba(59,130,246,0.15);
+      color: #93c5fd;
+      border-color: rgba(59,130,246,0.45);
+    }
+    .state-build-sell {
+      background: rgba(249,115,22,0.14);
+      color: #fdba74;
+      border-color: rgba(249,115,22,0.45);
+    }
+    .state-r2cb, .state-r2cs {
+      background: rgba(234,179,8,0.14);
+      color: #fde68a;
+      border-color: rgba(234,179,8,0.45);
+    }
+    .state-final-buy {
+      background: rgba(16,185,129,0.14);
+      color: #6ee7b7;
+      border-color: rgba(16,185,129,0.45);
+    }
+    .state-final-sell {
+      background: rgba(239,68,68,0.14);
+      color: #fca5a5;
+      border-color: rgba(239,68,68,0.45);
+    }
+    .state-cancel {
+      background: rgba(107,114,128,0.18);
+      color: #d1d5db;
+      border-color: rgba(107,114,128,0.45);
+    }
+    @media (max-width: 900px) {
+      .symbol-mini-grid {
+        grid-template-columns: 1fr;
+      }
+      .symbol-mini-top {
+        flex-direction: column;
+      }
+      .symbol-mini-right {
+        text-align: left;
+      }
+    }
+    a { color: #93c5fd; text-decoration: none; }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0f172a;
+      padding: 10px;
+      border-radius: 10px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>PocketOption Bot Dashboard</h1>
+      <div class="statusline">
+        <div>Symbol: <strong id="symbol">-</strong></div>
+        <div>Mode: <strong id="active_mode">-</strong></div>
+        <div>Running: <strong id="running">-</strong></div>
+        <div>Ticks: <strong id="ticks_seen">-</strong></div>
+        <div>Closed candles: <strong id="closed_len">-</strong></div>
+        <div>Last price: <strong id="last_price">-</strong></div>
+        <div>Last tick age: <strong id="last_tick_age">-</strong></div>
+      </div>
+      <div class="small muted" style="margin-top:8px;">Auto refresh: 5s</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Stats</h2>
+        <div id="stats_box" class="mono">loading...</div>
+      </div>
+
+      <div class="card">
+        <h2>Režim přepínání</h2>
+        <div id="switch_mode_box" class="mono">loading...</div>
+        <div class="buttons">
+          <button onclick="setSwitchMode('AUTO')">AUTO</button>
+          <button class="gray" onclick="setSwitchMode('MANUAL')">MANUAL</button>
+        </div>
+        <div id="switch_mode_msg" class="small muted" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="card">
+        <h2>Telegram oznámení</h2>
+        <div id="prepare_alerts_box" class="mono">loading...</div>
+        <div class="buttons">
+          <button class="green" onclick="setPrepareAlerts(true)">ZAPNOUT</button>
+          <button class="red" onclick="setPrepareAlerts(false)">VYPNOUT</button>
+        </div>
+        <div id="prepare_alerts_msg" class="small muted" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="card">
+        <h2>Poslední signál</h2>
+        <div id="last_signal_box" class="mono">loading...</div>
+        <div class="buttons">
+          <button onclick="signalAction('take')">TAKE</button>
+          <button class="gray" onclick="signalAction('skip')">SKIP</button>
+          <button class="green" onclick="signalAction('win')">WIN</button>
+          <button class="red" onclick="signalAction('loss')">LOSS</button>
+          <button onclick="createTestSignal()">CREATE TEST</button>
+        </div>
+        <div id="action_msg" class="small muted" style="margin-top:10px;"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>4 symboly scan</h2>
+      <div id="multi_symbols_wrap">loading...</div>
+    </div>
+
+    <div class="card">
+      <h2>Posledních 5 signálů</h2>
+      <div id="signals_table_wrap">loading...</div>
+    </div>
+
+    <div class="card">
+      <h2>HA graf</h2>
+      <div id="ha_chart_wrap">loading...</div>
+    </div>
+
+    <div class="card">
+      <h2>Posledních 10 uzavřených svíček</h2>
+      <div id="candles_table_wrap">loading...</div>
+    </div>
+  </div>
+
+<script>
+let lastSignalId = null;
+
+async function api(url, opts) {
+  const res = await fetch(url, opts || {});
+  return await res.json();
+}
+
+function esc(v) {
+  if (v === null || v === undefined) return "";
+  return String(v)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function fmt(v) {
+  if (v === null || v === undefined) return "-";
+  return String(v);
+}
+
+function fmtNum(v, digits = 3) {
+  if (v === null || v === undefined || v === "") return "-";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return esc(v);
+  return n.toFixed(digits);
+}
+
+function statusText(v) {
+  if (v === true) return '<span class="ok">YES</span>';
+  if (v === false) return '<span class="bad">NO</span>';
+  return esc(v);
+}
+
+async function loadStatus() {
+  const d = await api("/api/tick_status");
+  document.getElementById("symbol").textContent = d.symbol || "-";
+  document.getElementById("active_mode").textContent = d.active_mode || "-";
+  document.getElementById("running").innerHTML = statusText(d.tick_feed?.running);
+  document.getElementById("ticks_seen").textContent = fmt(d.tick_feed?.ticks_seen);
+  document.getElementById("closed_len").textContent = fmt(d.stream_closed_len);
+  document.getElementById("last_price").textContent = fmt(d.tick_feed?.last_price);
+  document.getElementById("last_tick_age").textContent = fmt(d.tick_feed?.last_tick_age_sec);
+}
+
+async function loadStats() {
+  const d = await api("/api/stats");
+  const html = `
+    <div class="row"><div>Signals total</div><div><strong>${fmt(d.signals_total)}</strong></div></div>
+    <div class="row"><div>Trades total</div><div><strong>${fmt(d.trades_total)}</strong></div></div>
+    <div class="row"><div>WIN</div><div><strong>${fmt(d.results?.win)}</strong></div></div>
+    <div class="row"><div>LOSS</div><div><strong>${fmt(d.results?.loss)}</strong></div></div>
+    <div class="row"><div>Winrate</div><div><strong>${fmt(d.results?.winrate)}%</strong></div></div>
+    <div class="row"><div>new</div><div><strong>${fmt(d.signals?.new)}</strong></div></div>
+    <div class="row"><div>taken</div><div><strong>${fmt(d.signals?.taken)}</strong></div></div>
+    <div class="row"><div>skipped</div><div><strong>${fmt(d.signals?.skipped)}</strong></div></div>
+    <div class="row"><div>win</div><div><strong>${fmt(d.signals?.win)}</strong></div></div>
+    <div class="row"><div>loss</div><div><strong>${fmt(d.signals?.loss)}</strong></div></div>
+  `;
+  document.getElementById("stats_box").innerHTML = html;
+}
+
+async function loadSwitchMode() {
+  const d = await api("/api/switch_mode");
+  const mode = d.switch_mode || "-";
+  document.getElementById("switch_mode_box").innerHTML = `
+    <div class="row"><div>Režim</div><div><strong>${esc(mode)}</strong></div></div>
+    <div class="row"><div>Aktivní symbol</div><div><strong>${esc(d.active_symbol || "-")}</strong></div></div>
+  `;
+}
+
+async function loadPrepareAlerts() {
+  const d = await api("/api/strategy/alerts");
+  const enabled = !!d.alerts_enabled;
+  document.getElementById("prepare_alerts_box").innerHTML = `
+    <div class="row"><div>Telegram oznámení</div><div><strong>${enabled ? "ZAPNUTÉ" : "VYPNUTÉ"}</strong></div></div>
+  `;
+}
+
+async function setPrepareAlerts(enabled) {
+  const msg = document.getElementById("prepare_alerts_msg");
+  msg.textContent = "Ukládám...";
+  try {
+    const d = await api(`/api/strategy/alerts?enabled=${enabled ? "true" : "false"}`, { method: "POST" });
+    if (!d.ok) {
+      msg.textContent = d.error || "Změna oznámení selhala";
+      return;
+    }
+    msg.textContent = `Telegram oznámení jsou ${d.alerts_enabled ? "ZAPNUTÉ" : "VYPNUTÉ"}`;
+    await loadPrepareAlerts();
+  } catch (e) {
+    msg.textContent = "Chyba komunikace";
+  }
+}
+
+async function setSwitchMode(mode) {
+  const msg = document.getElementById("switch_mode_msg");
+  msg.textContent = "Ukládám...";
+  try {
+    const d = await api(`/api/switch_mode?mode=${encodeURIComponent(mode)}`, { method: "POST" });
+    if (!d.ok) {
+      msg.textContent = d.error || "Změna režimu selhala";
+      return;
+    }
+    msg.textContent = `Režim nastaven na ${d.switch_mode}`;
+    await loadSwitchMode();
+    await loadMultiSymbols();
+  } catch (e) {
+    msg.textContent = "Chyba komunikace";
+  }
+}
+
+async function switchActiveSymbol(symbol) {
+  const msg = document.getElementById("switch_mode_msg");
+  msg.textContent = "Přepínám symbol...";
+  try {
+    await api(`/api/switch_mode?mode=MANUAL`, { method: "POST" });
+    const d = await api(`/api/symbols/switch?symbol=${encodeURIComponent(symbol)}`, { method: "POST" });
+    if (!d.ok) {
+      msg.textContent = d.error || "Přepnutí symbolu selhalo";
+      return;
+    }
+    msg.textContent = `Aktivní symbol přepnut na ${d.active_symbol}`;
+    await refreshAll();
+  } catch (e) {
+    msg.textContent = "Chyba komunikace";
+  }
+}
+
+async function loadMultiSymbols() {
+  const d = await api("/api/strategy/debug_all_symbols");
+  const items = d.items || [];
+
+  if (!items.length) {
+    document.getElementById("multi_symbols_wrap").innerHTML = '<div class="muted">Žádná data</div>';
+    return;
+  }
+
+  const humanState = (item) => {
+    const state = item.state || "";
+    const main = item.market_state_main || "";
+    const reason = item.reason || "";
+
+    if (item.final_buy || state === "FINAL_BUY") return "FINAL BUY";
+    if (item.final_sell || state === "FINAL_SELL") return "FINAL SELL";
+    if (item.prepare_buy || state === "PREPARE_BUY") return "R2CB";
+    if (item.prepare_sell || state === "PREPARE_SELL") return "R2CS";
+    if (state === "CHAOS_NO_TRADE" || main === "CHAOS") return "CHAOS";
+    if (reason.toLowerCase().includes("cancel")) return "ZRUŠENO";
+    if ((main.includes("BUY") || state.includes("BUY"))) return "VYTVÁŘÍ SE BUY";
+    if ((main.includes("SELL") || state.includes("SELL"))) return "VYTVÁŘÍ SE SELL";
+    return "CHAOS";
+  };
+
+  const infoText = (label) => {
+    if (label === "CHAOS") return "Trh nečitelný";
+    if (label === "VYTVÁŘÍ SE BUY") return "BUY se skládá";
+    if (label === "VYTVÁŘÍ SE SELL") return "SELL se skládá";
+    if (label === "R2CB") return "2 křížky pro BUY";
+    if (label === "R2CS") return "2 křížky pro SELL";
+    if (label === "FINAL BUY") return "BUY potvrzen";
+    if (label === "FINAL SELL") return "SELL potvrzen";
+    if (label === "ZRUŠENO") return "Setup padl";
+    return "-";
+  };
+
+  const stateClass = (label) => {
+    if (label === "CHAOS") return "state-chaos";
+    if (label === "VYTVÁŘÍ SE BUY") return "state-build-buy";
+    if (label === "VYTVÁŘÍ SE SELL") return "state-build-sell";
+    if (label === "R2CB") return "state-r2cb";
+    if (label === "R2CS") return "state-r2cs";
+    if (label === "FINAL BUY") return "state-final-buy";
+    if (label === "FINAL SELL") return "state-final-sell";
+    if (label === "ZRUŠENO") return "state-cancel";
+    return "state-chaos";
+  };
+
+  const cards = items.map(item => {
+    const label = humanState(item);
+    const active = item.is_active ? '<span class="pill up">AKTIVNÍ</span>' : '<span class="pill">SCAN</span>';
+    const action = item.is_active
+      ? '<span class="muted">aktivní</span>'
+      : `<button class="gray" onclick="switchActiveSymbol('${esc(item.symbol)}')">Přepnout</button>`;
+
+    return `
+      <div class="symbol-mini-card">
+        <div class="symbol-mini-top">
+          <div>
+            <div class="symbol-mini-name">${esc(item.symbol)}</div>
+            <div style="margin-top:6px;">${active}</div>
+          </div>
+          <div class="symbol-mini-right">
+            <span class="state-badge ${stateClass(label)}">${esc(label)}</span>
+            <div class="small muted" style="margin-top:8px;">${esc(infoText(label))}</div>
+          </div>
+        </div>
+        <div class="symbol-mini-bottom">
+          ${action}
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  document.getElementById("multi_symbols_wrap").innerHTML = `
+    <div class="symbol-mini-grid">
+      ${cards}
+    </div>
+  `;
+}
+
+async function loadLastSignal() {
+  const d = await api("/api/signals/last");
+  const item = d.item;
+
+  if (!item) {
+    lastSignalId = null;
+    document.getElementById("last_signal_box").innerHTML = '<div class="muted">Žádný signál</div>';
+    return;
+  }
+
+  lastSignalId = item.id;
+  const sideClass = item.side === "BUY" ? "up" : "down";
+  document.getElementById("last_signal_box").innerHTML = `
+    <div class="row"><div>ID</div><div><strong>${esc(item.id)}</strong></div></div>
+    <div class="row"><div>Symbol</div><div><strong>${esc(item.symbol)}</strong></div></div>
+    <div class="row"><div>Side</div><div><span class="pill ${sideClass}">${esc(item.side)}</span></div></div>
+    <div class="row"><div>Status</div><div><strong>${esc(item.status)}</strong></div></div>
+    <div class="row"><div>Reason</div><div><strong>${esc(item.reason)}</strong></div></div>
+    <div class="row"><div>Candle TS</div><div><strong>${esc(item.candle_ts)}</strong></div></div>
+    <div class="row"><div>Expires TS</div><div><strong>${esc(item.expires_at_ts)}</strong></div></div>
+    <div class="row"><div>Created</div><div><strong>${esc(item.created_at)}</strong></div></div>
+  `;
+}
+
+async function loadSignals() {
+  const d = await api("/api/signals?limit=5");
+  const items = d.items || [];
+
+  if (!items.length) {
+    document.getElementById("signals_table_wrap").innerHTML = '<div class="muted">Žádné signály</div>';
+    return;
+  }
+
+  const rows = items.map(item => `
+    <tr>
+      <td>${esc(item.id)}</td>
+      <td>${esc(item.symbol)}</td>
+      <td>${esc(item.side)}</td>
+      <td>${esc(item.status)}</td>
+      <td>${esc(item.reason)}</td>
+      <td>${esc(item.candle_ts)}</td>
+      <td>${esc(item.created_at)}</td>
+    </tr>
+  `).join("");
+
+  document.getElementById("signals_table_wrap").innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Status</th>
+          <th>Reason</th>
+          <th>Candle TS</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+
+
+function makeHaChart(items) {
+  if (!items || !items.length) {
+    return '<div class="muted">Žádná data pro HA graf</div>';
+  }
+
+  const chartItems = items.slice(-30).filter(x =>
+    x &&
+    x.ha_open !== undefined &&
+    x.ha_high !== undefined &&
+    x.ha_low !== undefined &&
+    x.ha_close !== undefined
+  );
+
+  if (!chartItems.length) {
+    return '<div class="muted">HA data nejsou dostupná</div>';
+  }
+
+  const width = 1100;
+  const height = 320;
+  const padL = 16;
+  const padR = 16;
+  const padT = 16;
+  const padB = 24;
+  const plotW = width - padL - padR;
+  const plotH = height - padT - padB;
+
+  const vals = [];
+  for (const x of chartItems) {
+    vals.push(Number(x.ha_high), Number(x.ha_low), Number(x.ha_open), Number(x.ha_close));
+  }
+
+  let minV = Math.min(...vals);
+  let maxV = Math.max(...vals);
+
+  if (!Number.isFinite(minV) || !Number.isFinite(maxV)) {
+    return '<div class="muted">Neplatná HA data</div>';
+  }
+
+  if (maxV === minV) {
+    maxV += 0.001;
+    minV -= 0.001;
+  }
+
+  const range = maxV - minV;
+  const topV = maxV + range * 0.05;
+  const botV = minV - range * 0.05;
+  const fullRange = topV - botV;
+
+  const y = (v) => {
+    const n = (topV - v) / fullRange;
+    return padT + n * plotH;
+  };
+
+  const step = plotW / chartItems.length;
+  const bodyW = Math.max(4, step * 0.55);
+
+  const grid = [];
+  for (let i = 0; i < 5; i++) {
+    const gy = padT + (plotH / 4) * i;
+    grid.push(`<line x1="${padL}" y1="${gy}" x2="${width - padR}" y2="${gy}" stroke="#1f2937" stroke-width="1"/>`);
+  }
+
+  const candles = chartItems.map((c, i) => {
+    const xCenter = padL + step * i + step / 2;
+
+    const ho = Number(c.ha_open);
+    const hh = Number(c.ha_high);
+    const hl = Number(c.ha_low);
+    const hc = Number(c.ha_close);
+
+    const yo = y(ho);
+    const yh = y(hh);
+    const yl = y(hl);
+    const yc = y(hc);
+
+    const bodyTop = Math.min(yo, yc);
+    const bodyBottom = Math.max(yo, yc);
+    const bodyHeight = Math.max(2, bodyBottom - bodyTop);
+
+    const isUp = hc >= ho;
+    const stroke = isUp ? "#10b981" : "#ef4444";
+    const fill = isUp ? "#10b981" : "#ef4444";
+
+    const title = esc(
+      `${c.open_time || c.timestamp} | HA O:${fmtNum(ho)} H:${fmtNum(hh)} L:${fmtNum(hl)} C:${fmtNum(hc)}`
+    );
+
+    return `
+      <g>
+        <title>${title}</title>
+        <line x1="${xCenter}" y1="${yh}" x2="${xCenter}" y2="${yl}" stroke="${stroke}" stroke-width="2"/>
+        <rect x="${xCenter - bodyW / 2}" y="${bodyTop}" width="${bodyW}" height="${bodyHeight}" rx="1" fill="${fill}" stroke="${stroke}" stroke-width="1"/>
+      </g>
+    `;
+  }).join("");
+
+  const labels = `
+    <div class="small muted" style="margin-top:8px; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+      <span>Min: <strong>${fmtNum(minV)}</strong></span>
+      <span>Max: <strong>${fmtNum(maxV)}</strong></span>
+      <span>Svíček: <strong>${chartItems.length}</strong></span>
+      <span>Typ: <strong>Heikin Ashi</strong></span>
+    </div>
+  `;
+
+  return `
+    <div style="overflow:auto;">
+      <svg viewBox="0 0 ${width} ${height}" width="100%" height="320" preserveAspectRatio="none" style="background:#0f172a;border-radius:12px;border:1px solid #1f2937;">
+        ${grid.join("")}
+        ${candles}
+      </svg>
+    </div>
+    ${labels}
+  `;
+}
+
+async function loadHaChart() {
+  const d = await api("/api/last_n?n=30&closed=1");
+  const items = d.items || [];
+  document.getElementById("ha_chart_wrap").innerHTML = makeHaChart(items);
+}
+
+
+async function loadCandles() {
+  const d = await api("/api/last_n?n=10&closed=1");
+  const items = d.items || [];
+
+  if (!items.length) {
+    document.getElementById("candles_table_wrap").innerHTML = '<div class="muted">Žádné candles</div>';
+    return;
+  }
+
+  const rows = items.map(item => {
+    const haDir = item.ha_dir || "";
+    const dirClass = haDir === "UP" ? "up" : (haDir === "DOWN" ? "down" : "");
+    return `
+      <tr>
+        <td>${esc(item.open_time || item.timestamp)}</td>
+        <td>${fmtNum(item.open)}</td>
+        <td>${fmtNum(item.high)}</td>
+        <td>${fmtNum(item.low)}</td>
+        <td>${fmtNum(item.close)}</td>
+        <td>${fmtNum(item.ha_open)}</td>
+        <td>${fmtNum(item.ha_high)}</td>
+        <td>${fmtNum(item.ha_low)}</td>
+        <td>${fmtNum(item.ha_close)}</td>
+        <td><span class="pill ${dirClass}">${esc(haDir || "-")}</span></td>
+        <td>${esc(item.source || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+
+  document.getElementById("candles_table_wrap").innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>O</th>
+          <th>H</th>
+          <th>L</th>
+          <th>C</th>
+          <th>HA O</th>
+          <th>HA H</th>
+          <th>HA L</th>
+          <th>HA C</th>
+          <th>HA Dir</th>
+          <th>Src</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+async function signalAction(action) {
+  const msg = document.getElementById("action_msg");
+  if (!lastSignalId) {
+    msg.textContent = "Není poslední signál.";
+    return;
+  }
+
+  msg.textContent = "Provádím " + action + "...";
+  try {
+    const d = await api(`/api/signals/${lastSignalId}/${action}`, {
+      method: "POST"
+    });
+    msg.textContent = JSON.stringify(d);
+    await refreshAll();
+  } catch (e) {
+    msg.textContent = "Chyba: " + e;
+  }
+}
+
+async function createTestSignal() {
+  const msg = document.getElementById("action_msg");
+  msg.textContent = "Vytvářím test signál...";
+  try {
+    const d = await api("/api/signals/create_test", { method: "POST" });
+    msg.textContent = JSON.stringify(d);
+    await refreshAll();
+  } catch (e) {
+    msg.textContent = "Chyba: " + e;
+  }
+}
+
+async function refreshAll() {
+  await Promise.all([
+    loadStatus(),
+    loadStats(),
+    loadSwitchMode(),
+    loadPrepareAlerts(),
+    loadMultiSymbols(),
+    loadLastSignal(),
+    loadSignals(),
+    loadHaChart(),
+    loadCandles()
+  ]);
+}
+
+refreshAll();
+setInterval(refreshAll, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+def _tg_get_token():
+    return (os.getenv("TG_BOT_TOKEN") or "").strip()
+
+
+def _tg_get_chat_id():
+    return (os.getenv("TG_CHAT_ID") or "").strip()
+
+
+def _tg_is_ready():
+    return bool(_tg_get_token() and _tg_get_chat_id())
+
+
+def _tg_call_api(method: str, payload_dict: dict | None = None):
+    token = _tg_get_token()
+    if not token:
+        return {"ok": False, "error": "missing_tg_bot_token"}
+
+    payload_dict = dict(payload_dict or {})
+    for k, v in list(payload_dict.items()):
+        if isinstance(v, (dict, list)):
+            payload_dict[k] = json.dumps(v, ensure_ascii=False)
+
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    payload = urllib.parse.urlencode(payload_dict).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return {
+                "ok": True,
+                "status_code": getattr(resp, "status", 200),
+                "response_text": raw,
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+def _tg_send_message(text_msg: str, reply_markup=None):
+    chat_id = _tg_get_chat_id()
+    if not chat_id:
+        return {"ok": False, "error": "missing_tg_chat_id"}
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text_msg,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+
+    return _tg_call_api("sendMessage", payload)
+
+
+def _human_state_label_from_debug(debug):
+    debug = dict(debug or {})
+    state = str(debug.get("state") or "")
+    main = str(debug.get("market_state_main") or "")
+    reason = str(debug.get("reason") or "")
+    final_buy = bool(debug.get("final_buy"))
+    final_sell = bool(debug.get("final_sell"))
+    prepare_buy = bool(debug.get("prepare_buy"))
+    prepare_sell = bool(debug.get("prepare_sell"))
+
+    if final_buy or state == "FINAL_BUY":
+        return "FINAL BUY"
+    if final_sell or state == "FINAL_SELL":
+        return "FINAL SELL"
+
+    if prepare_buy or state == "PREPARE_BUY":
+        return "R2CB"
+    if prepare_sell or state == "PREPARE_SELL":
+        return "R2CS"
+
+    if state == "CHAOS_NO_TRADE" or main == "CHAOS":
+        return "CHAOS"
+
+    if "BUY" in state or "BUY" in main:
+        if "cancel" in reason.lower():
+            return "ZRUŠENO"
+        return "VYTVÁŘÍ SE BUY"
+
+    if "SELL" in state or "SELL" in main:
+        if "cancel" in reason.lower():
+            return "ZRUŠENO"
+        return "VYTVÁŘÍ SE SELL"
+
+    return "CHAOS"
+
+
+def _tg_build_signal_text(symbol: str, side: str, time_text: str):
+    side_icon = "🟢" if str(side).upper() == "BUY" else "🔴"
+    return (
+        f"📊 Symbol: {symbol}\n"
+        f"{side_icon} Směr: {side}\n"
+        f"🕒 Čas: {time_text}"
+    )
+
+
+def _tg_build_prepare_message(symbol: str, side: str):
+    side = str(side).upper()
+    header = "🟡 R2CB" if side == "BUY" else "🟡 R2CS"
+    side_icon = "🟢" if side == "BUY" else "🔴"
+    return (
+        f"{header}\n\n"
+        f"📊 Symbol: {symbol}\n"
+        f"{side_icon} Směr: {side}\n\n"
+        "Vytvořily se 2 křížky. Čeká se na potvrzení."
+    )
+
+
+def _tg_build_final_message(symbol: str, side: str):
+    side = str(side).upper()
+    header = "🚀 FINAL BUY" if side == "BUY" else "🚀 FINAL SELL"
+    side_icon = "🟢" if side == "BUY" else "🔴"
+    return (
+        f"{header}\n\n"
+        f"📊 Symbol: {symbol}\n"
+        f"{side_icon} Směr: {side}\n\n"
+        "Směr je potvrzený."
+    )
+
+
+def _tg_build_result_message(symbol: str, side: str, result_value: str, balance_text: str):
+    side = str(side).upper()
+    result_value = str(result_value).upper()
+    side_icon = "🟢" if side == "BUY" else "🔴"
+    header = "✅ OBCHOD UZAVŘEN — WIN" if result_value == "WIN" else "❌ OBCHOD UZAVŘEN — LOSS"
+    return (
+        f"{header}\n\n"
+        f"📊 Symbol: {symbol}\n"
+        f"{side_icon} Směr: {side}\n"
+        f"💰 Zůstatek: {balance_text}"
+    )
+
+
+def _tg_get_balance_text():
+    balance_value = None
+    try:
+        stats = _stats_read() or {}
+        balance_value = stats.get("balance")
+    except Exception:
+        balance_value = None
+
+    if balance_value is None:
+        return "?"
+    try:
+        return f"{float(balance_value):.2f}"
+    except Exception:
+        return str(balance_value)
+
+
+def _tg_build_status_message():
+    debug = {}
+    try:
+        debug = _strategy_v1__build_debug() or {}
+    except Exception:
+        debug = {}
+
+    balance_text = _tg_get_balance_text()
+    human_state = _human_state_label_from_debug(debug)
+    return (
+        "🤖 STAV BOTA\n\n"
+        f"▶️ Běží: ANO\n"
+        f"📊 Symbol: {getattr(STATE, 'symbol', '?')}\n"
+        f"📌 Stav: {human_state}\n"
+        f"⚙️ Režim: {getattr(STATE, 'switch_mode', '?')}\n"
+        f"💰 Zůstatek: {balance_text}"
+    )
+
+
+def _tg_build_balance_message():
+    balance_text = _tg_get_balance_text()
+    return (
+        "💰 ZŮSTATEK\n\n"
+        f"Aktuální zůstatek: {balance_text}"
+    )
+
+
+def _tg_build_last_signal_message():
+    row = _db_fetchone(
+        """
+        SELECT *
+        FROM signals
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+    if not row:
+        return "📭 POSLEDNÍ SIGNÁL\n\nŽádný signál nebyl nalezen."
+
+    symbol = str(row.get("symbol") or "?")
+    side = str(row.get("side") or "?").upper()
+    status = str(row.get("status") or "?")
+    side_icon = "🟢" if side == "BUY" else ("🔴" if side == "SELL" else "⚪")
+    return (
+        "🕘 POSLEDNÍ SIGNÁL\n\n"
+        f"📊 Symbol: {symbol}\n"
+        f"{side_icon} Směr: {side}\n"
+        f"📌 Status: {status}"
+    )
+
+
+def _tg_send_document_bytes(filename: str, content_bytes: bytes, caption: str | None = None, content_type: str = "application/octet-stream"):
+    token = _tg_get_token()
+    chat_id = _tg_get_chat_id()
+
+    if not token:
+        return {"ok": False, "error": "missing_tg_bot_token"}
+    if not chat_id:
+        return {"ok": False, "error": "missing_tg_chat_id"}
+
+    boundary = "----tgBoundary7MA4YWxkTrZu0gW"
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+
+    parts = []
+
+    def _field(name: str, value: str):
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+
+    _field("chat_id", str(chat_id))
+    if caption:
+        _field("caption", str(caption))
+
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    parts.append(content_bytes)
+    parts.append(b"\r\n")
+    parts.append((f"--{boundary}--\r\n").encode("utf-8"))
+
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return {
+                "ok": True,
+                "status_code": getattr(resp, "status", 200),
+                "response_text": raw,
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+
+def _tg_send_photo_bytes(filename: str, content_bytes: bytes, caption: str | None = None, content_type: str = "image/png"):
+    token = _tg_get_token()
+    chat_id = _tg_get_chat_id()
+
+    if not token:
+        return {"ok": False, "error": "missing_tg_bot_token"}
+    if not chat_id:
+        return {"ok": False, "error": "missing_tg_chat_id"}
+
+    boundary = "----tgBoundaryPhoto7MA4YWxkTrZu0gW"
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+
+    parts = []
+
+    def _field(name: str, value: str):
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+
+    _field("chat_id", str(chat_id))
+    if caption:
+        _field("caption", str(caption))
+
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    parts.append(content_bytes)
+    parts.append(b"\r\n")
+    parts.append((f"--{boundary}--\r\n").encode("utf-8"))
+
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return {
+                "ok": True,
+                "status_code": getattr(resp, "status", 200),
+                "response_text": raw,
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+
+def _tg_build_ha_chart_png_bytes(items):
+    chart_items = []
+    for x in list(items or [])[-30:]:
+        if not isinstance(x, dict):
+            continue
+        if all(k in x for k in ("ha_open", "ha_high", "ha_low", "ha_close")):
+            chart_items.append(x)
+
+    if not chart_items:
+        return None
+
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+        from matplotlib.patches import Rectangle
+    except Exception as e:
+        raise RuntimeError(f"matplotlib_not_available: {e}")
+
+    width = 1100
+    height = 320
+    dpi = 100
+    fig = Figure(figsize=(width / dpi, height / dpi), dpi=dpi, facecolor="#0f172a")
+    ax = fig.add_subplot(111)
+    ax.set_facecolor("#0f172a")
+
+    vals = []
+    for x in chart_items:
+        vals.extend([
+            float(x["ha_high"]),
+            float(x["ha_low"]),
+            float(x["ha_open"]),
+            float(x["ha_close"]),
+        ])
+
+    min_v = min(vals)
+    max_v = max(vals)
+    if max_v == min_v:
+        max_v += 0.001
+        min_v -= 0.001
+
+    rng = max_v - min_v
+    top_v = max_v + rng * 0.05
+    bot_v = min_v - rng * 0.05
+
+    ax.set_xlim(-0.5, len(chart_items) - 0.5)
+    ax.set_ylim(bot_v, top_v)
+    ax.grid(True, axis="y", color="#1f2937", linewidth=1)
+    ax.grid(False, axis="x")
+
+    for spine in ax.spines.values():
+        spine.set_color("#1f2937")
+
+    ax.tick_params(axis="x", colors="#94a3b8", labelsize=8)
+    ax.tick_params(axis="y", colors="#94a3b8", labelsize=8)
+
+    body_w = 0.55
+
+    for i, c in enumerate(chart_items):
+        ho = float(c["ha_open"])
+        hh = float(c["ha_high"])
+        hl = float(c["ha_low"])
+        hc = float(c["ha_close"])
+
+        is_up = hc >= ho
+        color = "#10b981" if is_up else "#ef4444"
+
+        ax.vlines(i, hl, hh, color=color, linewidth=2, zorder=2)
+
+        body_bottom = min(ho, hc)
+        body_height = max(abs(hc - ho), 1e-9)
+        rect = Rectangle(
+            (i - body_w / 2, body_bottom),
+            body_w,
+            body_height,
+            facecolor=color,
+            edgecolor=color,
+            linewidth=1,
+            zorder=3,
+        )
+        ax.add_patch(rect)
+
+    ax.set_title(f"HA graf: {getattr(STATE, 'symbol', '?')}", color="#e5e7eb", fontsize=12)
+    ax.set_xticks(range(len(chart_items)))
+    ax.set_xticklabels([""] * len(chart_items))
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight")
+    return buf.getvalue()
+
+def _tg_build_ha_chart_svg(items):
+    chart_items = []
+    for x in list(items or [])[-30:]:
+        if not isinstance(x, dict):
+            continue
+        if all(k in x for k in ("ha_open", "ha_high", "ha_low", "ha_close")):
+            chart_items.append(x)
+
+    if not chart_items:
+        return None
+
+    width = 1100
+    height = 320
+    pad_l = 16
+    pad_r = 16
+    pad_t = 16
+    pad_b = 24
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    vals = []
+    for x in chart_items:
+        vals.extend([
+            float(x["ha_high"]),
+            float(x["ha_low"]),
+            float(x["ha_open"]),
+            float(x["ha_close"]),
+        ])
+
+    min_v = min(vals)
+    max_v = max(vals)
+    if max_v == min_v:
+        max_v += 0.001
+        min_v -= 0.001
+
+    rng = max_v - min_v
+    top_v = max_v + rng * 0.05
+    bot_v = min_v - rng * 0.05
+    full_rng = top_v - bot_v
+
+    def y(v: float) -> float:
+        n = (top_v - v) / full_rng
+        return pad_t + n * plot_h
+
+    step = plot_w / max(1, len(chart_items))
+    body_w = max(4.0, step * 0.55)
+
+    grid = []
+    for i in range(5):
+        gy = pad_t + (plot_h / 4) * i
+        grid.append(
+            f'<line x1="{pad_l}" y1="{gy:.2f}" x2="{width - pad_r}" y2="{gy:.2f}" stroke="#1f2937" stroke-width="1"/>'
+        )
+
+    candles = []
+    for i, c in enumerate(chart_items):
+        x_center = pad_l + step * i + step / 2
+
+        ho = float(c["ha_open"])
+        hh = float(c["ha_high"])
+        hl = float(c["ha_low"])
+        hc = float(c["ha_close"])
+
+        yo = y(ho)
+        yh = y(hh)
+        yl = y(hl)
+        yc = y(hc)
+
+        body_top = min(yo, yc)
+        body_bottom = max(yo, yc)
+        body_height = max(2.0, body_bottom - body_top)
+
+        is_up = hc >= ho
+        color = "#10b981" if is_up else "#ef4444"
+
+        candles.append(
+            f'<line x1="{x_center:.2f}" y1="{yh:.2f}" x2="{x_center:.2f}" y2="{yl:.2f}" stroke="{color}" stroke-width="2"/>'
+        )
+        candles.append(
+            f'<rect x="{(x_center - body_w / 2):.2f}" y="{body_top:.2f}" width="{body_w:.2f}" height="{body_height:.2f}" rx="1" fill="{color}" stroke="{color}" stroke-width="1"/>'
+        )
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}">'
+        f'<rect x="0" y="0" width="{width}" height="{height}" fill="#0f172a"/>'
+        + "".join(grid)
+        + "".join(candles)
+        + '</svg>'
+    )
+    return svg
+
+
+def _tg_send_chart():
+    d = _tg_call_local_api("/api/last_n?n=30&closed=1", method="GET")
+    if not d.get("ok"):
+        return {"ok": False, "error": d.get("error", "chart_data_fetch_failed")}
+
+    items = d.get("items") or []
+    try:
+        png_bytes = _tg_build_ha_chart_png_bytes(items)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    if not png_bytes:
+        return {"ok": False, "error": "no_chart_data"}
+
+    symbol = str(getattr(STATE, "symbol", "?"))
+    return _tg_send_photo_bytes(
+        filename=f"{symbol}_ha_chart.png",
+        content_bytes=png_bytes,
+        caption=f"📈 HA graf: {symbol}",
+        content_type="image/png",
+    )
+
+def _tg_send_trade_result_if_ready(signal_row, result_value: str):
+    if not STRATEGY_V1_ALERTS_ENABLED:
+        return {"ok": True, "sent": False, "reason": "alerts_disabled"}
+
+    if not signal_row:
+        return {"ok": False, "sent": False, "reason": "missing_signal_row"}
+
+    symbol = str(signal_row.get("symbol") or "?")
+    side = str(signal_row.get("side") or "?").upper()
+
+    balance_value = None
+    try:
+        stats = _stats_read() or {}
+        balance_value = stats.get("balance")
+    except Exception:
+        balance_value = None
+
+    if balance_value is None:
+        balance_text = "?"
+    else:
+        try:
+            balance_text = f"{float(balance_value):.2f}"
+        except Exception:
+            balance_text = str(balance_value)
+
+    message = _tg_build_result_message(
+        symbol=symbol,
+        side=side,
+        result_value=result_value,
+        balance_text=balance_text,
+    )
+
+    result = _tg_send_message(
+        message,
+        reply_markup=_tg_signal_actions_markup(),
+    )
+    return {
+        "ok": True,
+        "sent": bool(result and result.get("ok")),
+        "message": message,
+        "telegram_result": result,
+    }
+
+
+@app.get("/api/telegram/status")
+def api_telegram_status():
+    return {
+        "ok": True,
+        "ready": _tg_is_ready(),
+        "has_token": bool(_tg_get_token()),
+        "has_chat_id": bool(_tg_get_chat_id()),
+    }
+
+
+@app.post("/api/telegram/test")
+def api_telegram_test(kind: str = "basic", side: str = "BUY", symbol: str | None = None):
+    symbol = str(symbol or getattr(STATE, "symbol", "UNKNOWN"))
+    side = str(side or "BUY").upper()
+
+    if kind == "prepare":
+        msg = _tg_build_prepare_message(symbol=symbol, side=side)
+    elif kind == "final":
+        msg = _tg_build_final_message(symbol=symbol, side=side)
+    elif kind == "status":
+        msg = _tg_build_status_message()
+    elif kind == "balance":
+        msg = _tg_build_balance_message()
+    elif kind == "last":
+        msg = _tg_build_last_signal_message()
+    else:
+        msg = _tg_build_signal_text(
+            symbol=symbol,
+            side=side,
+            time_text=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    result = _tg_send_message(msg)
+    return {
+        "ok": result.get("ok", False),
+        "kind": kind,
+        "side": side,
+        "symbol": symbol,
+        "message": msg,
+        "result": result,
+    }
+
+
+TG_MENU_RUNNING = False
+TG_LAST_UPDATE_ID = 0
+
+
+def _tg_signal_actions_markup():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📈 Chart", "callback_data": "show:chart"},
+                {"text": "🤖 Status", "callback_data": "show:status"},
+                {"text": "💰 Balance", "callback_data": "show:balance"},
+            ],
+        ]
+    }
+
+
+def _tg_build_main_menu_text():
+    symbol = str(getattr(STATE, "symbol", "?"))
+    mode = str(getattr(STATE, "switch_mode", "?"))
+    alerts = "ON" if bool(globals().get("STRATEGY_V1_ALERTS_ENABLED", False)) else "OFF"
+    return (
+        "🤖 OVLÁDÁNÍ BOTA\n\n"
+        f"📊 Aktivní symbol: {symbol}\n"
+        f"⚙️ Režim: {mode}\n"
+        f"🔔 Alerts: {alerts}\n\n"
+        "Vyber akci:"
+    )
+
+def _tg_main_menu_markup():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Symbol", "callback_data": "menu:symbol"},
+                {"text": "⚙️ Režim", "callback_data": "menu:mode"},
+            ],
+            [
+                {"text": "🔔 Alerts", "callback_data": "menu:alerts"},
+                {"text": "💰 Balance", "callback_data": "show:balance"},
+            ],
+            [
+                {"text": "🤖 Status", "callback_data": "show:status"},
+                {"text": "🕘 Last", "callback_data": "show:last"},
+            ],
+            [
+                {"text": "📈 Chart", "callback_data": "show:chart"},
+            ],
+        ]
+    }
+
+
+def _tg_symbol_menu_markup():
+    buttons = []
+    current_symbol = str(getattr(STATE, "symbol", "?"))
+    symbols = list(getattr(STATE, "symbols", []) or [])
+    row = []
+
+    for sym in symbols:
+        label = f"✅ {sym}" if sym == current_symbol else sym
+        row.append({"text": label, "callback_data": f"set_symbol:{sym}"})
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append([{"text": "⬅️ Zpět", "callback_data": "menu:main"}])
+    return {"inline_keyboard": buttons}
+
+
+def _tg_mode_menu_markup():
+    current_mode = str(getattr(STATE, "switch_mode", "?")).upper()
+    auto_label = "✅ AUTO" if current_mode == "AUTO" else "AUTO"
+    manual_label = "✅ MANUAL" if current_mode == "MANUAL" else "MANUAL"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": auto_label, "callback_data": "set_mode:AUTO"},
+                {"text": manual_label, "callback_data": "set_mode:MANUAL"},
+            ],
+            [{"text": "⬅️ Zpět", "callback_data": "menu:main"}],
+        ]
+    }
+
+
+def _tg_alerts_menu_markup():
+    enabled = bool(globals().get("STRATEGY_V1_ALERTS_ENABLED", False))
+    on_label = "✅ ON" if enabled else "ON"
+    off_label = "✅ OFF" if not enabled else "OFF"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": on_label, "callback_data": "set_alerts:ON"},
+                {"text": off_label, "callback_data": "set_alerts:OFF"},
+            ],
+            [{"text": "⬅️ Zpět", "callback_data": "menu:main"}],
+        ]
+    }
+
+
+def _tg_send_main_menu():
+    return _tg_send_temp_message(
+        _tg_build_main_menu_text(),
+        reply_markup=_tg_main_menu_markup(),
+        delete_after_sec=30,
+    )
+
+def _tg_answer_callback(callback_query_id: str, text_msg: str = ""):
+    return _tg_call_api(
+        "answerCallbackQuery",
+        {
+            "callback_query_id": callback_query_id,
+            "text": text_msg,
+        },
+    )
+
+
+def _tg_call_local_api(path: str, method: str = "GET"):
+    url = f"http://127.0.0.1:8000{path}"
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+            return {"ok": False, "error": "invalid_json_response", "raw": raw}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "path": path}
+
+
+def _tg_safe_switch_mode(mode: str):
+    mode = str(mode or "").upper().strip()
+    if mode not in ("AUTO", "MANUAL"):
+        return {"ok": False, "error": "invalid_mode"}
+    return _tg_call_local_api(
+        f"/api/switch_mode?mode={urllib.parse.quote(mode)}",
+        method="POST",
+    )
+
+
+def _tg_safe_set_alerts(enabled_text: str):
+    enabled = str(enabled_text or "").upper().strip() == "ON"
+    enabled_str = "true" if enabled else "false"
+    return _tg_call_local_api(
+        f"/api/strategy/alerts?enabled={enabled_str}",
+        method="POST",
+    )
+
+
+def _tg_safe_switch_symbol(symbol: str):
+    symbols = list(getattr(STATE, "symbols", []) or [])
+    if symbol not in symbols:
+        return {"ok": False, "error": "invalid_symbol", "allowed_symbols": symbols}
+    return _tg_call_local_api(
+        f"/api/symbols/switch?symbol={urllib.parse.quote(symbol)}",
+        method="POST",
+    )
+
+
+
+def _tg_extract_message_id(send_result):
+    try:
+        raw = (send_result or {}).get("response_text") or "{}"
+        data = json.loads(raw)
+        result = data.get("result") or {}
+        mid = result.get("message_id")
+        return int(mid) if mid is not None else None
+    except Exception:
+        return None
+
+
+def _tg_delete_message(message_id: int):
+    chat_id = _tg_get_chat_id()
+    if not chat_id:
+        return {"ok": False, "error": "missing_tg_chat_id"}
+    return _tg_call_api(
+        "deleteMessage",
+        {
+            "chat_id": str(chat_id),
+            "message_id": str(message_id),
+        },
+    )
+
+
+def _tg_schedule_delete(message_id: int, delay_sec: int = 20):
+    def _runner():
+        try:
+            time.sleep(max(1, int(delay_sec)))
+            _tg_delete_message(int(message_id))
+        except Exception:
+            pass
+
+    t = threading.Thread(
+        target=_runner,
+        name=f"tg-delete-{message_id}",
+        daemon=True,
+    )
+    t.start()
+
+
+def _tg_send_temp_message(text_msg: str, reply_markup=None, delete_after_sec: int = 20):
+    result = _tg_send_message(text_msg, reply_markup=reply_markup)
+    if result and result.get("ok"):
+        mid = _tg_extract_message_id(result)
+        if mid is not None:
+            _tg_schedule_delete(mid, delete_after_sec)
+    return result
+
+
+TG_ACTION_DEBOUNCE_SEC = 2.5
+TG_LAST_ACTION_TS = {}
+
+
+def _tg_debounce_ok(action_key: str, cooldown_sec: float = TG_ACTION_DEBOUNCE_SEC):
+    now = time.time()
+    last = float(TG_LAST_ACTION_TS.get(action_key, 0.0) or 0.0)
+    wait_left = cooldown_sec - (now - last)
+    if wait_left > 0:
+        return False, round(wait_left, 1)
+    TG_LAST_ACTION_TS[action_key] = now
+    return True, 0.0
+
+
+def _tg_handle_text_command(text_msg: str):
+    cmd = str(text_msg or "").strip()
+
+    if cmd in ("/start", "/menu"):
+        _tg_send_main_menu()
+        return
+
+    if cmd == "/status":
+        _tg_send_temp_message(_tg_build_status_message(), delete_after_sec=20)
+        return
+
+    if cmd == "/balance":
+        _tg_send_temp_message(_tg_build_balance_message(), delete_after_sec=20)
+        return
+
+    if cmd == "/last":
+        _tg_send_temp_message(_tg_build_last_signal_message(), delete_after_sec=20)
+        return
+
+    if cmd == "/chart":
+        r = _tg_send_chart()
+        if not r.get("ok"):
+            _tg_send_message(f"❌ CHART SELHAL\n\n{r.get('error', 'unknown_error')}")
+        return
+
+    if cmd == "/auto":
+        ok_go, wait_left = _tg_debounce_ok("cmd:auto")
+        if not ok_go:
+            _tg_send_message(f"⏳ Počkej {wait_left}s a zkus to znovu.")
+            return
+        d = _tg_safe_switch_mode("AUTO")
+        _tg_send_message(f"⚙️ REŽIM ZMĚNĚN\n\nNový režim: {d.get('switch_mode', '?')}")
+        return
+
+    if cmd == "/manual":
+        ok_go, wait_left = _tg_debounce_ok("cmd:manual")
+        if not ok_go:
+            _tg_send_message(f"⏳ Počkej {wait_left}s a zkus to znovu.")
+            return
+        d = _tg_safe_switch_mode("MANUAL")
+        _tg_send_message(f"⚙️ REŽIM ZMĚNĚN\n\nNový režim: {d.get('switch_mode', '?')}")
+        return
+
+    if cmd.startswith("/symbol "):
+        sym = cmd.split(" ", 1)[1].strip()
+        ok_go, wait_left = _tg_debounce_ok(f"cmd:symbol:{sym}")
+        if not ok_go:
+            _tg_send_message(f"⏳ Počkej {wait_left}s a zkus to znovu.")
+            return
+        d = _tg_safe_switch_symbol(sym)
+        if d.get("ok"):
+            _tg_send_message(f"📊 SYMBOL ZMĚNĚN\n\nAktivní symbol: {d.get('active_symbol', sym)}")
+        else:
+            _tg_send_message("❌ ZMĚNA SYMBOLU SELHALA")
+        return
+
+
+def _tg_handle_callback(data: str, callback_query_id: str):
+    if data == "menu:main":
+        _tg_answer_callback(callback_query_id)
+        _tg_send_main_menu()
+        return
+
+    if data == "menu:symbol":
+        _tg_answer_callback(callback_query_id)
+        _tg_send_message(
+            f"📊 VÝBĚR SYMBOLU\n\nAktivní symbol: {getattr(STATE, 'symbol', '?')}\n\nVyber trh:",
+            reply_markup=_tg_symbol_menu_markup(),
+        )
+        return
+
+    if data == "menu:mode":
+        _tg_answer_callback(callback_query_id)
+        _tg_send_message(
+            f"⚙️ REŽIM BOTA\n\nAktuálně: {getattr(STATE, 'switch_mode', '?')}\n\nVyber nový režim:",
+            reply_markup=_tg_mode_menu_markup(),
+        )
+        return
+
+    if data == "menu:alerts":
+        _tg_answer_callback(callback_query_id)
+        _tg_send_message(
+            f"🔔 UPOZORNĚNÍ\n\nAktuálně: {'ON' if bool(globals().get('STRATEGY_V1_ALERTS_ENABLED', False)) else 'OFF'}\n\nVyber nastavení:",
+            reply_markup=_tg_alerts_menu_markup(),
+        )
+        return
+
+    if data == "show:status":
+        _tg_answer_callback(callback_query_id)
+        _tg_send_temp_message(_tg_build_status_message(), delete_after_sec=20)
+        return
+
+    if data == "show:balance":
+        _tg_answer_callback(callback_query_id)
+        _tg_send_temp_message(_tg_build_balance_message(), delete_after_sec=20)
+        return
+
+    if data == "show:last":
+        _tg_answer_callback(callback_query_id)
+        _tg_send_temp_message(_tg_build_last_signal_message(), delete_after_sec=20)
+        return
+
+    if data == "show:chart":
+        _tg_answer_callback(callback_query_id, "Posílám chart...")
+        r = _tg_send_chart()
+        if not r.get("ok"):
+            _tg_send_message(f"❌ CHART SELHAL\n\n{r.get('error', 'unknown_error')}")
+        return
+
+    if data.startswith("set_mode:"):
+        mode = data.split(":", 1)[1]
+        ok_go, wait_left = _tg_debounce_ok(f"cb:set_mode:{mode}")
+        if not ok_go:
+            _tg_answer_callback(callback_query_id, f"Počkej {wait_left}s")
+            return
+        _tg_answer_callback(callback_query_id, "Přepínám režim...")
+        d = _tg_safe_switch_mode(mode)
+        if d.get("ok"):
+            _tg_send_message(f"⚙️ REŽIM ZMĚNĚN\n\nNový režim: {d.get('switch_mode', '?')}")
+        else:
+            _tg_send_message(f"❌ ZMĚNA REŽIMU SELHALA\n\n{d.get('error', 'unknown_error')}")
+        return
+
+    if data.startswith("set_alerts:"):
+        val = data.split(":", 1)[1]
+        ok_go, wait_left = _tg_debounce_ok(f"cb:set_alerts:{val}")
+        if not ok_go:
+            _tg_answer_callback(callback_query_id, f"Počkej {wait_left}s")
+            return
+        _tg_answer_callback(callback_query_id, "Přepínám alerts...")
+        d = _tg_safe_set_alerts(val)
+        if d.get("ok"):
+            state = "ZAPNUTÉ" if d.get("alerts_enabled") else "VYPNUTÉ"
+            _tg_send_message(f"🔔 UPOZORNĚNÍ\n\nTelegram oznámení jsou {state}")
+        else:
+            _tg_send_message(f"❌ ZMĚNA ALERTS SELHALA\n\n{d.get('error', 'unknown_error')}")
+        return
+
+    if data.startswith("set_symbol:"):
+        sym = data.split(":", 1)[1]
+        ok_go, wait_left = _tg_debounce_ok(f"cb:set_symbol:{sym}")
+        if not ok_go:
+            _tg_answer_callback(callback_query_id, f"Počkej {wait_left}s")
+            return
+        _tg_answer_callback(callback_query_id, "Přepínám symbol...")
+        d = _tg_safe_switch_symbol(sym)
+        if d.get("ok"):
+            _tg_send_message(f"📊 SYMBOL ZMĚNĚN\n\nAktivní symbol: {d.get('active_symbol', sym)}")
+        else:
+            _tg_send_message(f"❌ ZMĚNA SYMBOLU SELHALA\n\n{d.get('error', 'unknown_error')}")
+        return
+
+
+def _tg_poll_once():
+    global TG_LAST_UPDATE_ID
+
+    chat_id = _tg_get_chat_id()
+    if not chat_id:
+        return
+
+    result = _tg_call_api(
+        "getUpdates",
+        {
+            "offset": int(TG_LAST_UPDATE_ID or 0) + 1,
+            "timeout": 20,
+            "allowed_updates": ["message", "callback_query"],
+        },
+    )
+    if not result.get("ok"):
+        return
+
+    raw = result.get("response_text") or "{}"
+    data = __import__("json").loads(raw)
+
+    for upd in data.get("result", []):
+        TG_LAST_UPDATE_ID = max(int(TG_LAST_UPDATE_ID or 0), int(upd.get("update_id") or 0))
+
+        if upd.get("message"):
+            msg = upd["message"]
+            incoming_chat_id = str(((msg.get("chat") or {}).get("id") or ""))
+            if incoming_chat_id != str(chat_id):
+                continue
+            text_msg = str(msg.get("text") or "").strip()
+            if text_msg.startswith("/"):
+                _tg_handle_text_command(text_msg)
+
+        if upd.get("callback_query"):
+            cq = upd["callback_query"]
+            incoming_chat_id = str((((cq.get("message") or {}).get("chat") or {}).get("id") or ""))
+            if incoming_chat_id != str(chat_id):
+                continue
+            _tg_handle_callback(
+                data=str(cq.get("data") or ""),
+                callback_query_id=str(cq.get("id") or ""),
+            )
+
+
+def _tg_menu_loop():
+    global TG_MENU_RUNNING
+    if TG_MENU_RUNNING:
+        return
+    TG_MENU_RUNNING = True
+
+    def _runner():
+        while True:
+            try:
+                if _tg_is_ready():
+                    _tg_poll_once()
+            except Exception:
+                pass
+            time.sleep(1)
+
+    t = threading.Thread(target=_runner, name="telegram-menu-loop", daemon=True)
+    t.start()
+
+
+@app.on_event("startup")
+def _tg_menu_startup():
+    _tg_menu_loop()

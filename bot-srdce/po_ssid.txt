@@ -1,0 +1,1 @@
+42["auth",{"session":"7gke1jpdn9tne1vb2b9j5moful","isDemo":1,"uid":38814348,"platform":9,"isFastHistory":true,"isOptimized":true}]

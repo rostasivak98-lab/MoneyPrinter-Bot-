@@ -1,0 +1,547 @@
+import argparse
+import asyncio
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI
+import uvicorn
+from playwright.async_api import async_playwright
+
+from app.main import (
+    PO_PW_BROWSER,
+    PO_PW_HEADLESS,
+    PO_PW_URL,
+    PO_PW_PROFILE_DIR,
+    TF_SEC,
+    WARMUP_GRACE_SEC,
+    _parse_json_from_anyframe,
+    _extract_socketio_event_name_if_placeholder,
+    _find_ticks_recursive,
+    _sanitize_preview,
+    _calibrate_tick_ts,
+    _open_close_str,
+    _age_sec,
+)
+
+def _align(ts: int) -> int:
+    return ts - (ts % TF_SEC)
+
+def _ts_open_from_tick(ts_used: float) -> int:
+    return _align(int(ts_used))
+
+def _norm(s: str) -> str:
+    return str(s or "").strip().lower()
+
+def _pw_symbol_to_ui_text(symbol: str) -> str:
+    s = str(symbol or "").strip()
+    low = s.lower()
+    otc = low.endswith("_otc")
+    if otc:
+        s = s[:-4]
+
+    parts = s.split("_")
+    if len(parts) == 1 and len(s) == 6 and s.isalpha():
+        ui = f"{s[:3]}/{s[3:]}"
+    elif len(parts) == 1:
+        ui = s.replace("-", "/")
+    else:
+        ui = "/".join(parts)
+
+    return f"{ui.upper()} OTC" if otc else ui.upper()
+
+def _ui_text_matches_symbol(ui_text: Optional[str], symbol: str) -> bool:
+    got = str(ui_text or "").upper().strip()
+    want = _pw_symbol_to_ui_text(symbol).upper().strip()
+    return bool(got) and (want in got or got in want)
+
+async def _read_ui_symbol_text(page) -> Optional[str]:
+    try:
+        txt = await page.locator("a.pair-number-wrap").first.inner_text(timeout=1500)
+        return str(txt or "").strip()
+    except Exception:
+        return None
+
+async def _close_popups_on_page(page) -> None:
+    selectors = [
+        ".mfp-close",
+        ".modal__close",
+        ".popup__close",
+        ".close",
+        "[data-close]",
+        ".btn-close",
+    ]
+
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0:
+                try:
+                    await loc.click(timeout=600)
+                    await page.wait_for_timeout(150)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(150)
+    except Exception:
+        pass
+
+    try:
+        wrap = page.locator(".mfp-wrap").first
+        if await wrap.count() > 0:
+            try:
+                box = await wrap.bounding_box()
+                if box:
+                    x = max(1, box["x"] + 10)
+                    y = max(1, box["y"] + 10)
+                    await page.mouse.click(x, y)
+                    await page.wait_for_timeout(150)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+async def _switch_symbol_with_popup_fix(page, symbol: str) -> Dict[str, Any]:
+    ui_text = _pw_symbol_to_ui_text(symbol)
+    last_error = None
+
+    for attempt in range(1, 6):
+        try:
+            await _close_popups_on_page(page)
+
+            opener = page.locator("a.pair-number-wrap").first
+            await opener.click(timeout=3000)
+            await page.wait_for_timeout(700)
+
+            item = page.locator(
+                "a.alist__link",
+                has=page.locator("span.alist__label", has_text=ui_text)
+            ).first
+
+            if await item.count() == 0:
+                last_error = f"symbol_not_found_in_list:{ui_text}"
+                await _close_popups_on_page(page)
+                await page.wait_for_timeout(300)
+                continue
+
+            await item.click(timeout=3000)
+            await page.wait_for_timeout(1200)
+            await _close_popups_on_page(page)
+            await page.wait_for_timeout(500)
+
+            current_ui = await _read_ui_symbol_text(page)
+            if _ui_text_matches_symbol(current_ui, symbol):
+                return {
+                    "ok": True,
+                    "symbol": symbol,
+                    "ui_text": ui_text,
+                    "attempt": attempt,
+                    "current_ui": current_ui,
+                }
+
+            last_error = f"switched_but_ui_mismatch:{current_ui}"
+            await page.wait_for_timeout(300)
+
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            try:
+                await _close_popups_on_page(page)
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
+
+    return {
+        "ok": False,
+        "symbol": symbol,
+        "ui_text": ui_text,
+        "error": last_error or "unknown_switch_error",
+    }
+
+@dataclass
+class LocalFeed:
+    symbol: str
+    running: bool = False
+    last_err: str = "—"
+
+    ws_seen: int = 0
+    frames_seen: int = 0
+    ticks_seen: int = 0
+    foreign_ticks_seen: int = 0
+
+    last_price: Optional[float] = None
+    last_tick_age_sec: Optional[float] = None
+    last_tick_local_ts: Optional[float] = None
+    last_tick_event: Optional[str] = None
+    tick_time_mode: str = "unknown"
+
+    warmup_active: bool = False
+    warmup_until_open_ts: Optional[int] = None
+    warmup_note: str = "—"
+
+    stream_current: Optional[Dict[str, Any]] = None
+    stream_closed: List[Dict[str, Any]] = field(default_factory=list)
+
+    frames_tail: List[Dict[str, Any]] = field(default_factory=list)
+    pending_event: Optional[str] = None
+    pending_ts: Optional[float] = None
+
+    last_target_tick_symbol: Optional[str] = None
+    last_foreign_tick_symbol: Optional[str] = None
+
+    ui_symbol_text: Optional[str] = None
+    ui_symbol_ok: bool = False
+    ui_symbol_last_ok_ts: Optional[float] = None
+    reswitch_count: int = 0
+
+STATE = None
+STOP_EVENT = asyncio.Event()
+APP = FastAPI(title="dual-stream-test")
+
+def _append_stream_closed(closed: Dict[str, Any]) -> None:
+    STATE.stream_closed.append(closed)
+    if len(STATE.stream_closed) > 300:
+        STATE.stream_closed = STATE.stream_closed[-300:]
+
+def _start_new_stream_candle(ts_open: int, price: float) -> None:
+    STATE.stream_current = {
+        "symbol": STATE.symbol,
+        "timestamp": ts_open,
+        "open": float(price),
+        "high": float(price),
+        "low": float(price),
+        "close": float(price),
+        "volume": 1.0,
+        "source": "STREAM_FORMING",
+        "open_time": _open_close_str(ts_open)[0],
+        "close_time": _open_close_str(ts_open)[1],
+    }
+
+def _maybe_init_warmup(ts_used: float) -> None:
+    if STATE.warmup_until_open_ts is not None:
+        return
+
+    ts_open = _ts_open_from_tick(ts_used)
+    sec_into_minute = float(ts_used) - float(ts_open)
+
+    if sec_into_minute <= WARMUP_GRACE_SEC:
+        STATE.warmup_active = False
+        STATE.warmup_until_open_ts = ts_open
+        STATE.warmup_note = f"disabled (start at +{sec_into_minute:.2f}s)"
+        return
+
+    STATE.warmup_active = True
+    STATE.warmup_until_open_ts = ts_open + TF_SEC
+    STATE.warmup_note = f"active until {STATE.warmup_until_open_ts} (start at +{sec_into_minute:.2f}s)"
+
+def _feed_preview(raw_text: str, kind: str) -> None:
+    STATE.frames_seen += 1
+    tail = STATE.frames_tail or []
+    tail.append({
+        "ts": time.time(),
+        "kind": kind,
+        "preview": _sanitize_preview(raw_text)[:160],
+    })
+    if len(tail) > 10:
+        tail = tail[-10:]
+    STATE.frames_tail = tail
+
+def _on_tick(ts_raw: float, price: float, event_name: Optional[str] = None) -> None:
+    ts_used, mode = _calibrate_tick_ts(float(ts_raw))
+
+    _maybe_init_warmup(ts_used)
+
+    STATE.ticks_seen += 1
+    STATE.last_price = float(price)
+    STATE.last_tick_local_ts = time.time()
+    STATE.last_tick_age_sec = 0.0
+    STATE.last_tick_event = event_name or STATE.last_tick_event
+    STATE.tick_time_mode = mode
+
+    ts_open = _ts_open_from_tick(ts_used)
+    cur = STATE.stream_current
+
+    if STATE.warmup_active and STATE.warmup_until_open_ts is not None:
+        if ts_open < STATE.warmup_until_open_ts:
+            if cur is None or int(cur["timestamp"]) != ts_open:
+                _start_new_stream_candle(ts_open, price)
+            else:
+                cur["high"] = max(cur["high"], float(price))
+                cur["low"] = min(cur["low"], float(price))
+                cur["close"] = float(price)
+                cur["volume"] = float(cur.get("volume", 0.0) + 1.0)
+                STATE.stream_current = cur
+            return
+
+        if ts_open == STATE.warmup_until_open_ts:
+            STATE.warmup_active = False
+            STATE.warmup_note = f"done at {ts_open}"
+            _start_new_stream_candle(ts_open, price)
+            return
+
+        STATE.warmup_active = False
+        STATE.warmup_note = f"forced-off at {ts_open}"
+
+    if cur and int(cur["timestamp"]) == ts_open:
+        cur["high"] = max(cur["high"], float(price))
+        cur["low"] = min(cur["low"], float(price))
+        cur["close"] = float(price)
+        cur["volume"] = float(cur.get("volume", 0.0) + 1.0)
+        STATE.stream_current = cur
+        return
+
+    if cur and cur.get("timestamp") is not None:
+        prev_ts = int(cur["timestamp"])
+        o, c = _open_close_str(prev_ts)
+        closed = {
+            "symbol": STATE.symbol,
+            "timestamp": prev_ts,
+            "open": float(cur["open"]),
+            "high": float(cur["high"]),
+            "low": float(cur["low"]),
+            "close": float(cur["close"]),
+            "volume": float(cur.get("volume", 0.0)),
+            "source": "STREAM",
+            "open_time": o,
+            "close_time": c,
+            "age_sec": _age_sec(prev_ts),
+        }
+        _append_stream_closed(closed)
+
+        last_close = float(cur["close"])
+        gap_ts = prev_ts + TF_SEC
+        while gap_ts < ts_open:
+            go, gc = _open_close_str(gap_ts)
+            gap_closed = {
+                "symbol": STATE.symbol,
+                "timestamp": gap_ts,
+                "open": last_close,
+                "high": last_close,
+                "low": last_close,
+                "close": last_close,
+                "volume": 0.0,
+                "source": "STREAM_GAP_FILL",
+                "open_time": go,
+                "close_time": gc,
+                "age_sec": _age_sec(gap_ts),
+            }
+            _append_stream_closed(gap_closed)
+            gap_ts += TF_SEC
+
+    _start_new_stream_candle(ts_open, price)
+
+async def worker_loop():
+    STATE.running = True
+    STATE.last_err = "—"
+
+    profile_dir = f"{PO_PW_PROFILE_DIR}__solo__{STATE.symbol}"
+    os.makedirs(profile_dir, exist_ok=True)
+
+    ctx = None
+    last_reswitch_ts = 0.0
+
+    try:
+        async with async_playwright() as p:
+            browser = p.webkit if PO_PW_BROWSER == "webkit" else p.chromium
+            ctx = await browser.launch_persistent_context(
+                user_data_dir=profile_dir,
+                headless=PO_PW_HEADLESS,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            page = await ctx.new_page()
+
+            def attach_ws(ws):
+                STATE.ws_seen += 1
+                ws.on("framereceived", lambda payload: _handle_payload(payload, sent=False))
+                ws.on("framesent", lambda payload: _handle_payload(payload, sent=True))
+
+            def _handle_payload(payload, sent: bool):
+                try:
+                    kind = "sent" if sent else "recv"
+
+                    if isinstance(payload, bytes):
+                        raw_text = payload.decode("utf-8", errors="ignore")
+                        _feed_preview(raw_text, kind + ":bytes")
+                    else:
+                        raw_text = str(payload)
+                        _feed_preview(raw_text, kind + ":str")
+
+                    obj = _parse_json_from_anyframe(raw_text)
+
+                    ev = _extract_socketio_event_name_if_placeholder(raw_text)
+                    if ev:
+                        STATE.pending_event = ev
+                        STATE.pending_ts = time.time()
+
+                    if obj is None:
+                        return
+
+                    paired_event = None
+                    paired_payload = obj
+
+                    if isinstance(obj, list) and len(obj) >= 2 and isinstance(obj[0], str):
+                        paired_event = obj[0]
+                        paired_payload = obj[1]
+                    else:
+                        if STATE.pending_event and STATE.pending_ts and (time.time() - STATE.pending_ts) <= 2.0:
+                            paired_event = STATE.pending_event
+                            paired_payload = obj
+                            STATE.pending_event = None
+                            STATE.pending_ts = None
+
+                    ticks = _find_ticks_recursive(paired_payload, limit=50)
+                    if not ticks:
+                        ticks = _find_ticks_recursive(obj, limit=50)
+                    if not ticks:
+                        return
+
+                    for sym_str, t, price in ticks:
+                        if _norm(sym_str) == _norm(STATE.symbol):
+                            STATE.last_target_tick_symbol = sym_str
+                            _on_tick(t, price, event_name=paired_event)
+                        else:
+                            STATE.foreign_ticks_seen += 1
+                            STATE.last_foreign_tick_symbol = sym_str
+
+                except Exception as e:
+                    STATE.last_err = f"{type(e).__name__}: {e}"
+
+            page.on("websocket", attach_ws)
+            ctx.on("websocket", attach_ws)
+
+            await page.goto(PO_PW_URL, wait_until="domcontentloaded")
+            await asyncio.sleep(2.0)
+
+            sw = await _switch_symbol_with_popup_fix(page, STATE.symbol)
+            if not sw.get("ok"):
+                STATE.last_err = f"switch_failed:{sw}"
+            else:
+                STATE.ui_symbol_text = sw.get("current_ui")
+                STATE.ui_symbol_ok = True
+                STATE.ui_symbol_last_ok_ts = time.time()
+
+            while not STOP_EVENT.is_set():
+                now = time.time()
+
+                if STATE.last_tick_local_ts:
+                    STATE.last_tick_age_sec = now - STATE.last_tick_local_ts
+
+                ui_text = await _read_ui_symbol_text(page)
+                if ui_text:
+                    STATE.ui_symbol_text = ui_text
+                    STATE.ui_symbol_ok = _ui_text_matches_symbol(ui_text, STATE.symbol)
+                    if STATE.ui_symbol_ok:
+                        STATE.ui_symbol_last_ok_ts = now
+
+                need_reswitch = False
+                need_reason = None
+
+                if STATE.ui_symbol_text and not STATE.ui_symbol_ok:
+                    if (now - last_reswitch_ts) >= 5.0:
+                        need_reswitch = True
+                        need_reason = f"ui_symbol_drift:{STATE.ui_symbol_text}"
+
+                elif STATE.last_tick_local_ts is None and STATE.last_foreign_tick_symbol:
+                    if (now - last_reswitch_ts) >= 10.0:
+                        need_reswitch = True
+                        need_reason = f"no_target_ticks_last_foreign:{STATE.last_foreign_tick_symbol}"
+
+                elif STATE.last_tick_local_ts is not None and STATE.last_tick_age_sec is not None and STATE.last_tick_age_sec > 12.0:
+                    if (now - last_reswitch_ts) >= 10.0:
+                        need_reswitch = True
+                        need_reason = f"stale_target_ticks:{STATE.last_tick_age_sec:.1f}s"
+
+                if need_reswitch:
+                    sw = await _switch_symbol_with_popup_fix(page, STATE.symbol)
+                    last_reswitch_ts = now
+                    STATE.reswitch_count += 1
+                    if sw.get("ok"):
+                        STATE.last_err = f"reswitched_ok:{need_reason}"
+                        await asyncio.sleep(1.0)
+                    else:
+                        STATE.last_err = f"reswitch_failed:{need_reason}:{sw}"
+
+                await asyncio.sleep(1.0)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        STATE.last_err = f"{type(e).__name__}: {e}"
+    finally:
+        STATE.running = False
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
+@APP.get("/status")
+def status():
+    return {
+        "ok": True,
+        "symbol": STATE.symbol,
+        "tick_feed": {
+            "running": bool(STATE.running),
+            "last_err": str(STATE.last_err),
+            "ws_seen": int(STATE.ws_seen or 0),
+            "frames_seen": int(STATE.frames_seen or 0),
+            "ticks_seen": int(STATE.ticks_seen or 0),
+            "foreign_ticks_seen": int(STATE.foreign_ticks_seen or 0),
+            "last_price": STATE.last_price,
+            "last_tick_age_sec": STATE.last_tick_age_sec,
+            "last_tick_event": STATE.last_tick_event,
+            "tick_time_mode": STATE.tick_time_mode,
+            "warmup_active": bool(STATE.warmup_active),
+            "warmup_note": str(STATE.warmup_note),
+            "frames_tail": list(STATE.frames_tail or []),
+        },
+        "symbol_guard": {
+            "desired_symbol": STATE.symbol,
+            "ui_symbol_text": STATE.ui_symbol_text,
+            "ui_symbol_ok": bool(STATE.ui_symbol_ok),
+            "ui_symbol_last_ok_ts": STATE.ui_symbol_last_ok_ts,
+            "last_target_tick_symbol": STATE.last_target_tick_symbol,
+            "last_foreign_tick_symbol": STATE.last_foreign_tick_symbol,
+            "reswitch_count": int(STATE.reswitch_count or 0),
+        },
+        "stream_closed_len": len(STATE.stream_closed),
+        "has_stream_current": bool(STATE.stream_current),
+        "active_mode": "STREAM" if len(STATE.stream_closed) >= 2 else "HISTORY",
+        "last_closed": STATE.stream_closed[-1] if STATE.stream_closed else None,
+        "recent_closed": STATE.stream_closed[-3:] if STATE.stream_closed else [],
+        "current": STATE.stream_current,
+    }
+
+@APP.on_event("startup")
+async def on_startup():
+    APP.state.worker_task = asyncio.create_task(worker_loop())
+
+@APP.on_event("shutdown")
+async def on_shutdown():
+    STOP_EVENT.set()
+    task = getattr(APP.state, "worker_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await asyncio.gather(task, return_exceptions=True)
+        except Exception:
+            pass
+
+def main():
+    global STATE
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", required=True)
+    parser.add_argument("--port", type=int, required=True)
+    args = parser.parse_args()
+
+    STATE = LocalFeed(symbol=args.symbol)
+
+    uvicorn.run(APP, host="127.0.0.1", port=args.port, log_level="info")
+
+if __name__ == "__main__":
+    main()

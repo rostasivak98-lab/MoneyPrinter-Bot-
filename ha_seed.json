@@ -1,0 +1,30 @@
+{
+  "CHFJPY_otc": {
+    "timestamp": 1776888780,
+    "ha_open": 203.69450569545288,
+    "ha_close": 203.667,
+    "updated_at": 1776889320.383765,
+    "reason": "minute_close"
+  },
+  "EURCHF_otc": {
+    "timestamp": 1776887100,
+    "ha_open": 0.8942302740922285,
+    "ha_close": 0.8931475,
+    "updated_at": 1776887280.194616,
+    "reason": "minute_close"
+  },
+  "AUDNZD_otc": {
+    "timestamp": 1776891960,
+    "ha_open": 1.2117427574765436,
+    "ha_close": 1.211555,
+    "updated_at": 1776892380.09315,
+    "reason": "minute_close"
+  },
+  "CADCHF_otc": {
+    "timestamp": 1776886860,
+    "ha_open": 0.6368759050662638,
+    "ha_close": 0.6374925,
+    "updated_at": 1776887400.1883829,
+    "reason": "minute_close"
+  }
+}

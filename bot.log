@@ -1,0 +1,123 @@
+[boot] demo=True tf=60s poll=1.0s count=5 offset=0s asset=CHFJPY_otc
+[ok] connected
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032300 close_ts=1771032360 O=197.93000 H=198.07100 L=197.92200 C=198.02100
+         OPEN : 2026-02-14 01:25:00 UTC | 2026-02-14 02:25:00 LOCAL
+         CLOSE: 2026-02-14 01:26:00 UTC | 2026-02-14 02:26:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032360 close_ts=1771032420 O=197.93000 H=198.07100 L=197.92200 C=198.02100
+         OPEN : 2026-02-14 01:26:00 UTC | 2026-02-14 02:26:00 LOCAL
+         CLOSE: 2026-02-14 01:27:00 UTC | 2026-02-14 02:27:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032420 close_ts=1771032480 O=198.01700 H=198.12300 L=197.99800 C=198.07600
+         OPEN : 2026-02-14 01:27:00 UTC | 2026-02-14 02:27:00 LOCAL
+         CLOSE: 2026-02-14 01:28:00 UTC | 2026-02-14 02:28:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032480 close_ts=1771032540 O=198.07000 H=198.08900 L=198.03100 C=198.06900
+         OPEN : 2026-02-14 01:28:00 UTC | 2026-02-14 02:28:00 LOCAL
+         CLOSE: 2026-02-14 01:29:00 UTC | 2026-02-14 02:29:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032540 close_ts=1771032600 O=198.06600 H=198.11200 L=198.01800 C=198.08900
+         OPEN : 2026-02-14 01:29:00 UTC | 2026-02-14 02:29:00 LOCAL
+         CLOSE: 2026-02-14 01:30:00 UTC | 2026-02-14 02:30:00 LOCAL
+[boot] demo=True tf=60s poll=1.0s count=5 offset=0s asset=CHFJPY_otc
+[ok] connected
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032600 close_ts=1771032660 O=198.07100 H=198.24100 L=198.04900 C=198.19500
+         OPEN : 2026-02-14 01:30:00 UTC | 2026-02-14 02:30:00 LOCAL
+         CLOSE: 2026-02-14 01:31:00 UTC | 2026-02-14 02:31:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032660 close_ts=1771032720 O=198.07100 H=198.24100 L=198.04900 C=198.19500
+         OPEN : 2026-02-14 01:31:00 UTC | 2026-02-14 02:31:00 LOCAL
+         CLOSE: 2026-02-14 01:32:00 UTC | 2026-02-14 02:32:00 LOCAL
+[boot] demo=True tf=60s poll=1.0s count=5 offset=0s asset=CHFJPY_otc
+[ok] connected
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032780 close_ts=1771032840 O=198.43100 H=198.55800 L=198.42100 C=198.52700
+         OPEN : 2026-02-14 01:33:00 UTC | 2026-02-14 02:33:00 LOCAL
+         CLOSE: 2026-02-14 01:34:00 UTC | 2026-02-14 02:34:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032840 close_ts=1771032900 O=198.43100 H=198.55800 L=198.42100 C=198.52700
+         OPEN : 2026-02-14 01:34:00 UTC | 2026-02-14 02:34:00 LOCAL
+         CLOSE: 2026-02-14 01:35:00 UTC | 2026-02-14 02:35:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771032900 close_ts=1771032960 O=198.52700 H=198.60000 L=198.51300 C=198.56000
+         OPEN : 2026-02-14 01:35:00 UTC | 2026-02-14 02:35:00 LOCAL
+         CLOSE: 2026-02-14 01:36:00 UTC | 2026-02-14 02:36:00 LOCAL
+[boot] demo=False tf=60s poll=1.0s count=5 offset=0s asset=CHFJPY_otc
+[ok] connected
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771033020 close_ts=1771033080 O=198.64200 H=198.67700 L=198.61300 C=198.64200
+         OPEN : 2026-02-14 01:37:00 UTC | 2026-02-14 02:37:00 LOCAL
+         CLOSE: 2026-02-14 01:38:00 UTC | 2026-02-14 02:38:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771033080 close_ts=1771033140 O=198.64200 H=198.67700 L=198.61300 C=198.64200
+         OPEN : 2026-02-14 01:38:00 UTC | 2026-02-14 02:38:00 LOCAL
+         CLOSE: 2026-02-14 01:39:00 UTC | 2026-02-14 02:39:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771033140 close_ts=1771033200 O=198.64900 H=198.64900 L=198.55500 C=198.56500
+         OPEN : 2026-02-14 01:39:00 UTC | 2026-02-14 02:39:00 LOCAL
+         CLOSE: 2026-02-14 01:40:00 UTC | 2026-02-14 02:40:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771033200 close_ts=1771033260 O=198.56100 H=198.56800 L=198.45300 C=198.51200
+         OPEN : 2026-02-14 01:40:00 UTC | 2026-02-14 02:40:00 LOCAL
+         CLOSE: 2026-02-14 01:41:00 UTC | 2026-02-14 02:41:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771033260 close_ts=1771033320 O=198.49000 H=198.57400 L=198.46000 C=198.57400
+         OPEN : 2026-02-14 01:41:00 UTC | 2026-02-14 02:41:00 LOCAL
+         CLOSE: 2026-02-14 01:42:00 UTC | 2026-02-14 02:42:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771033320 close_ts=1771033380 O=198.57400 H=198.66000 L=198.55500 C=198.65500
+         OPEN : 2026-02-14 01:42:00 UTC | 2026-02-14 02:42:00 LOCAL
+         CLOSE: 2026-02-14 01:43:00 UTC | 2026-02-14 02:43:00 LOCAL
+[boot] demo=False tf=60s poll=1.0s count=5 asset=CHFJPY_otc
+[ok] connected
+[boot] demo=False tf=60s poll=1.0s count=5 asset=CHFJPY_otc
+[ok] connected
+[warn] PocketOptionError: Failed to get candles: Failed to send message: received 1005 (no status code [internal]); then sent 1005 (no status code [internal])
+[ok] connected
+[warn] PocketOptionError: Failed to get candles: Failed to send message: received 1005 (no status code [internal]); then sent 1005 (no status code [internal])
+[boot] demo=True tf=60s poll=1.0s count=5 asset=CHFJPY_otc
+[ok] connected
+[warn] KeyError: 'Could not extract OHLC from candle'
+[warn] KeyError: 'Could not extract OHLC from candle'
+[warn] KeyError: 'Could not extract OHLC from candle'
+[warn] KeyError: 'Could not extract OHLC from candle'
+[warn] KeyError: 'Could not extract OHLC from candle'
+[boot] demo=True tf=60s poll=1.0s count=5 asset=CHFJPY_otc
+[ok] connected
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[warn] no timestamp in candle (cannot align)
+[boot] demo=True tf=60s poll=1.0s count=5 asset=CHFJPY_otc
+[ok] connected
+[debug-ts] no timestamp detected; using CALC_TS fallback
+[debug-ts] candle_type: <class 'pocketoptionapi_async.models.Candle'>
+[debug-ts] candle_keys: ['asset', 'close', 'high', 'low', 'open', 'timeframe', 'timestamp', 'volume']
+[debug-ts] candle_preview: {'asset': 'CHFJPY_otc', 'close': 198.329, 'high': 198.364, 'low': 198.244, 'open': 198.297, 'timeframe': 60, 'timestamp': datetime.datetime(2026, 2, 14, 3, 18), 'volume': 110.0}
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771034220 close_ts=1771034280 O=198.297 H=198.364 L=198.244 C=198.329
+         OPEN : 2026-02-14 01:57:00 UTC | 2026-02-14 02:57:00 LOCAL
+         CLOSE: 2026-02-14 01:58:00 UTC | 2026-02-14 02:58:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 CALC_TS open_ts=1771034280 close_ts=1771034340 O=198.329 H=198.400 L=198.318 C=198.338
+         OPEN : 2026-02-14 01:58:00 UTC | 2026-02-14 02:58:00 LOCAL
+         CLOSE: 2026-02-14 01:59:00 UTC | 2026-02-14 02:59:00 LOCAL
+[boot] demo=True tf=60s poll=1.0s count=5 asset=CHFJPY_otc
+[ok] connected
+[boot] demo=True tf=60s poll=1.0s count=5 asset=CHFJPY_otc
+[ok] connected
+[candle] asset=CHFJPY_otc tf=60 API_TS open_ts=1771035780 close_ts=1771035840 O=198.150 H=198.371 L=198.150 C=198.365
+         OPEN : 2026-02-14 02:23:00 UTC | 2026-02-14 03:23:00 LOCAL
+         CLOSE: 2026-02-14 02:24:00 UTC | 2026-02-14 03:24:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 API_TS open_ts=1771035840 close_ts=1771035900 O=198.362 H=198.396 L=198.267 C=198.287
+         OPEN : 2026-02-14 02:24:00 UTC | 2026-02-14 03:24:00 LOCAL
+         CLOSE: 2026-02-14 02:25:00 UTC | 2026-02-14 03:25:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 API_TS open_ts=1771035900 close_ts=1771035960 O=198.292 H=198.325 L=198.248 C=198.269
+         OPEN : 2026-02-14 02:25:00 UTC | 2026-02-14 03:25:00 LOCAL
+         CLOSE: 2026-02-14 02:26:00 UTC | 2026-02-14 03:26:00 LOCAL
+[boot] demo=True tf=60s poll=1.0s count=5 asset=CHFJPY_otc
+[ok] connected
+[boot] demo=True tf=60s poll=1.0s count=5 asset=CHFJPY_otc offset=-3600s
+[ok] connected
+[candle] asset=CHFJPY_otc tf=60 API_TS open_ts=1771032540 close_ts=1771032600 O=198.214 H=198.250 L=198.193 C=198.217
+         OPEN : 2026-02-14 01:29:00 UTC | 2026-02-14 02:29:00 LOCAL
+         CLOSE: 2026-02-14 01:30:00 UTC | 2026-02-14 02:30:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 API_TS open_ts=1771032600 close_ts=1771032660 O=198.211 H=198.352 L=198.197 C=198.335
+         OPEN : 2026-02-14 01:30:00 UTC | 2026-02-14 02:30:00 LOCAL
+         CLOSE: 2026-02-14 01:31:00 UTC | 2026-02-14 02:31:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 API_TS open_ts=1771032660 close_ts=1771032720 O=198.351 H=198.351 L=198.232 C=198.239
+         OPEN : 2026-02-14 01:31:00 UTC | 2026-02-14 02:31:00 LOCAL
+         CLOSE: 2026-02-14 01:32:00 UTC | 2026-02-14 02:32:00 LOCAL
+[candle] asset=CHFJPY_otc tf=60 API_TS open_ts=1771032720 close_ts=1771032780 O=198.239 H=198.277 L=198.150 C=198.173
+         OPEN : 2026-02-14 01:32:00 UTC | 2026-02-14 02:32:00 LOCAL
+         CLOSE: 2026-02-14 01:33:00 UTC | 2026-02-14 02:33:00 LOCAL

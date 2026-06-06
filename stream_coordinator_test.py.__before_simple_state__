@@ -1,0 +1,254 @@
+from fastapi import FastAPI
+import uvicorn
+import urllib.request
+import json
+import time
+from typing import Any, Dict, List
+
+APP = FastAPI(title="stream-coordinator-test")
+
+WORKERS = [
+    {"symbol": "AUDNZD_otc", "url": "http://127.0.0.1:8011/status"},
+    {"symbol": "EURCHF_otc", "url": "http://127.0.0.1:8013/status"},
+    {"symbol": "CHFJPY_otc", "url": "http://127.0.0.1:8014/status"},
+]
+
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+def _market_state_from_worker_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    if not item.get("worker_ok"):
+        return {
+            "symbol": item.get("symbol"),
+            "state": "CHAOS",
+            "reason": "worker_not_ok",
+        }
+
+    active_mode = str(item.get("active_mode") or "")
+    stream_closed_len = int(item.get("stream_closed_len") or 0)
+    recent_closed = list(item.get("recent_closed") or [])
+    current = item.get("current") or {}
+
+    if active_mode != "STREAM":
+        return {
+            "symbol": item.get("symbol"),
+            "state": "CHAOS",
+            "reason": "not_in_stream",
+        }
+
+    if stream_closed_len < 2 or len(recent_closed) < 2:
+        return {
+            "symbol": item.get("symbol"),
+            "state": "CHAOS",
+            "reason": "not_enough_recent_closed_stream_candles",
+        }
+
+    def candle_info(c: Dict[str, Any]) -> Dict[str, Any]:
+        o = _safe_float(c.get("open"))
+        cl = _safe_float(c.get("close"))
+        h = _safe_float(c.get("high"))
+        l = _safe_float(c.get("low"))
+
+        body = abs(cl - o)
+        rng = abs(h - l)
+        body_ratio = (body / rng) if rng > 0 else 0.0
+
+        upper_wick = max(0.0, h - max(o, cl))
+        lower_wick = max(0.0, min(o, cl) - l)
+
+        upper_wick_ratio = (upper_wick / rng) if rng > 0 else 0.0
+        lower_wick_ratio = (lower_wick / rng) if rng > 0 else 0.0
+
+        direction = "BUY" if cl >= o else "SELL"
+
+        return {
+            "dir": direction,
+            "body_ratio": body_ratio,
+            "upper_wick_ratio": upper_wick_ratio,
+            "lower_wick_ratio": lower_wick_ratio,
+            "open": o,
+            "close": cl,
+            "high": h,
+            "low": l,
+        }
+
+    def is_cross(x: Dict[str, Any]) -> bool:
+        return (
+            x["body_ratio"] <= 0.30
+            and x["upper_wick_ratio"] >= 0.15
+            and x["lower_wick_ratio"] >= 0.15
+        )
+
+    infos = [candle_info(c) for c in recent_closed[-3:]]
+    dirs = [x["dir"] for x in infos]
+
+    buy_count = dirs.count("BUY")
+    sell_count = dirs.count("SELL")
+
+    strong_buy = sum(1 for x in infos if x["dir"] == "BUY" and x["body_ratio"] >= 0.35)
+    strong_sell = sum(1 for x in infos if x["dir"] == "SELL" and x["body_ratio"] >= 0.35)
+
+    cur = candle_info(current) if current else None
+    cur_dir = cur["dir"] if cur else "NONE"
+    cur_body_ratio = cur["body_ratio"] if cur else 0.0
+
+    debug = {
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "strong_buy": strong_buy,
+        "strong_sell": strong_sell,
+        "cur_dir": cur_dir,
+        "cur_body_ratio": round(cur_body_ratio, 2),
+    }
+
+    if len(infos) >= 3:
+        anchor = infos[-3]
+        cross1 = infos[-2]
+        cross2 = infos[-1]
+        last2_cross = is_cross(cross1) and is_cross(cross2)
+
+        debug.update({
+            "anchor_dir": anchor["dir"],
+            "anchor_body_ratio": round(anchor["body_ratio"], 2),
+            "cross1_is_cross": is_cross(cross1),
+            "cross1_body_ratio": round(cross1["body_ratio"], 2),
+            "cross2_is_cross": is_cross(cross2),
+            "cross2_body_ratio": round(cross2["body_ratio"], 2),
+            "last2_cross": last2_cross,
+        })
+
+        if last2_cross:
+            if anchor["dir"] == "BUY" and anchor["body_ratio"] >= 0.35:
+                if not (cur and cur_dir == "SELL" and cur_body_ratio >= 0.60):
+                    return {
+                        "symbol": item.get("symbol"),
+                        "state": "R2CB",
+                        "reason": f"two_crosses_after_buy_anchor anchor_body={anchor['body_ratio']:.2f} cur={cur_dir}:{cur_body_ratio:.2f}",
+                        "debug": debug,
+                    }
+
+            if anchor["dir"] == "SELL" and anchor["body_ratio"] >= 0.35:
+                if not (cur and cur_dir == "BUY" and cur_body_ratio >= 0.60):
+                    return {
+                        "symbol": item.get("symbol"),
+                        "state": "R2CS",
+                        "reason": f"two_crosses_after_sell_anchor anchor_body={anchor['body_ratio']:.2f} cur={cur_dir}:{cur_body_ratio:.2f}",
+                        "debug": debug,
+                    }
+
+    if buy_count >= 2 and strong_buy >= 1:
+        if cur and cur_dir == "SELL" and cur_body_ratio >= 0.45:
+            return {
+                "symbol": item.get("symbol"),
+                "state": "CHAOS",
+                "reason": f"closed_buy_but_current_strong_sell buy_count={buy_count} strong_buy={strong_buy} cur_body_ratio={cur_body_ratio:.2f}",
+                "debug": debug,
+            }
+        return {
+            "symbol": item.get("symbol"),
+            "state": "VYTVÁŘÍ SE BUY",
+            "reason": f"recent_closed_buy buy_count={buy_count} sell_count={sell_count} strong_buy={strong_buy} cur={cur_dir}:{cur_body_ratio:.2f}",
+            "debug": debug,
+        }
+
+    if sell_count >= 2 and strong_sell >= 1:
+        if cur and cur_dir == "BUY" and cur_body_ratio >= 0.45:
+            return {
+                "symbol": item.get("symbol"),
+                "state": "CHAOS",
+                "reason": f"closed_sell_but_current_strong_buy sell_count={sell_count} strong_sell={strong_sell} cur_body_ratio={cur_body_ratio:.2f}",
+                "debug": debug,
+            }
+        return {
+            "symbol": item.get("symbol"),
+            "state": "VYTVÁŘÍ SE SELL",
+            "reason": f"recent_closed_sell buy_count={buy_count} sell_count={sell_count} strong_sell={strong_sell} cur={cur_dir}:{cur_body_ratio:.2f}",
+            "debug": debug,
+        }
+
+    return {
+        "symbol": item.get("symbol"),
+        "state": "CHAOS",
+        "reason": f"mixed_recent_closed buy_count={buy_count} sell_count={sell_count} strong_buy={strong_buy} strong_sell={strong_sell} cur={cur_dir}:{cur_body_ratio:.2f}",
+        "debug": debug,
+    }
+
+def fetch_json(url: str):
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        return json.loads(raw)
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+@APP.get("/status")
+def status():
+    items = []
+    now = time.time()
+
+    for w in WORKERS:
+        data = fetch_json(w["url"])
+        item = {
+            "symbol": w["symbol"],
+            "worker_ok": bool(data.get("ok")) if isinstance(data, dict) else False,
+            "worker_url": w["url"],
+            "fetched_at": now,
+        }
+
+        if isinstance(data, dict) and data.get("ok"):
+            item.update({
+                "active_mode": data.get("active_mode"),
+                "stream_closed_len": data.get("stream_closed_len"),
+                "has_stream_current": data.get("has_stream_current"),
+                "tick_feed": data.get("tick_feed"),
+                "last_closed": data.get("last_closed"),
+                "recent_closed": data.get("recent_closed"),
+                "current": data.get("current"),
+            })
+        else:
+            item["error"] = data.get("error", "worker_unavailable") if isinstance(data, dict) else "invalid_worker_response"
+
+        items.append(item)
+
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
+
+@APP.get("/api/coord/status")
+def coord_status():
+    raw = status()
+    simple = []
+    for item in raw["items"]:
+        simple.append({
+            "symbol": item["symbol"],
+            "worker_ok": item.get("worker_ok"),
+            "active_mode": item.get("active_mode"),
+            "stream_closed_len": item.get("stream_closed_len"),
+            "has_stream_current": item.get("has_stream_current"),
+        })
+    return {
+        "ok": True,
+        "items": simple,
+    }
+
+@APP.get("/api/coord/market_state")
+def coord_market_state():
+    raw = status()
+    items: List[Dict[str, Any]] = []
+    for item in raw["items"]:
+        items.append(_market_state_from_worker_item(item))
+    return {
+        "ok": True,
+        "items": items,
+    }
+
+def main():
+    uvicorn.run(APP, host="127.0.0.1", port=8020, log_level="info")
+
+if __name__ == "__main__":
+    main()

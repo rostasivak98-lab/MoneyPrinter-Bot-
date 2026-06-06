@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import time
+import csv
+import asyncio
+import signal
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import Any, List, Optional, Tuple
+
+from pocketoptionapi_async import AsyncPocketOptionClient
+
+
+SYMBOL = (os.getenv("PO_SYMBOL") or os.getenv("SYMBOL") or "CADCHF_otc").strip()
+TIMEFRAME_SEC = int(os.getenv("TIMEFRAME_SEC", "60"))
+FETCH_LAST_N = int(os.getenv("FETCH_LAST_N", "120"))
+POLL_SEC = float(os.getenv("POLL_SEC", "1.0"))
+SAFE_LAG_SEC = int(os.getenv("SAFE_LAG_SEC", "3"))
+BACKFILL = (os.getenv("BACKFILL", "0").strip().lower() in ("1", "true", "yes", "y", "on"))
+OUT_CSV = os.getenv("OUT_CSV", f"candles_{SYMBOL}.csv")
+
+# override (když chceš natvrdo): export FORCE_TZ_OFF_H=2
+FORCE_TZ_OFF_H = os.getenv("FORCE_TZ_OFF_H")
+FORCE_TZ_OFF_H = int(FORCE_TZ_OFF_H) if FORCE_TZ_OFF_H not in (None, "") else None
+
+# override (když chceš natvrdo): export FORCE_SKEW_SEC=0
+FORCE_SKEW_SEC = os.getenv("FORCE_SKEW_SEC")
+FORCE_SKEW_SEC = int(FORCE_SKEW_SEC) if FORCE_SKEW_SEC not in (None, "") else None
+
+_demo_raw = (os.getenv("PO_IS_DEMO") or os.getenv("PO_DEMO") or "1").strip().lower()
+PO_DEMO = _demo_raw in ("1", "true", "yes", "y", "on")
+
+
+@dataclass
+class Candle:
+    ts: int
+    o: float
+    h: float
+    l: float
+    c: float
+
+
+def fmt_local(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_utc(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_hms_local(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def ensure_csv_header(path: str) -> None:
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(
+            ["time_local", "time_utc", "ts", "symbol", "O", "H", "L", "C", "age_sec", "tz_off_h", "skew_sec"]
+        )
+
+
+def append_candle_csv(path: str, symbol: str, cd: Candle, age_sec: int, tz_off_h: int, skew_sec: int) -> None:
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(
+            [fmt_local(cd.ts), fmt_utc(cd.ts), cd.ts, symbol, cd.o, cd.h, cd.l, cd.c, age_sec, tz_off_h, skew_sec]
+        )
+
+
+def align_open_ts(ts: int) -> int:
+    return ts - (ts % TIMEFRAME_SEC)
+
+
+def pick_float(obj: Any, *names: str) -> Optional[float]:
+    for n in names:
+        if hasattr(obj, n):
+            try:
+                return float(getattr(obj, n))
+            except Exception:
+                pass
+    return None
+
+
+def pick_datetime(obj: Any) -> Optional[datetime]:
+    for k in ("timestamp", "time", "from", "at", "open_time", "openTime", "date"):
+        if hasattr(obj, k):
+            v = getattr(obj, k)
+            if isinstance(v, datetime):
+                return v
+    return None
+
+
+def pick_epoch(obj: Any) -> Optional[int]:
+    for k in ("timestamp", "time", "from", "at", "open_time", "openTime", "date"):
+        if hasattr(obj, k):
+            v = getattr(obj, k)
+            if isinstance(v, (int, float, str)):
+                try:
+                    iv = int(float(v))
+                    if iv > 10_000_000_000:
+                        iv //= 1000
+                    return iv
+                except Exception:
+                    pass
+    return None
+
+
+def detect_offset_and_skew(dts_naive: List[datetime], now_epoch: int) -> Tuple[int, int]:
+    """
+    Z balíku naivních datetime vyber offset (-12..+14),
+    kde existuje candle close nejblíž "teď". Skew = close_now_diff.
+    """
+    best_off = 0
+    best_skew = 0
+    best_abs = None
+
+    for off in range(-12, 15):
+        tz = timezone(timedelta(hours=off))
+        # najdi close nejblíž now
+        local_best_abs = None
+        local_best_skew = 0
+        for dt in dts_naive:
+            open_epoch = int(dt.replace(tzinfo=tz).timestamp())
+            open_epoch = align_open_ts(open_epoch)
+            close_epoch = open_epoch + TIMEFRAME_SEC
+            skew = close_epoch - now_epoch
+            a = abs(skew)
+            if local_best_abs is None or a < local_best_abs:
+                local_best_abs = a
+                local_best_skew = skew
+
+        if local_best_abs is None:
+            continue
+
+        if best_abs is None or local_best_abs < best_abs:
+            best_abs = local_best_abs
+            best_off = off
+            best_skew = local_best_skew
+
+    return best_off, best_skew
+
+
+RUNNING = True
+
+
+def _sig_handler(_sig, _frame):
+    global RUNNING
+    RUNNING = False
+
+
+async def main():
+    global RUNNING
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    ssid = (os.getenv("PO_SSID") or "").strip()
+    if not ssid:
+        print("[ERR] Chybí PO_SSID")
+        raise SystemExit(1)
+
+    ensure_csv_header(OUT_CSV)
+
+    client = AsyncPocketOptionClient(ssid, is_demo=PO_DEMO, enable_logging=False)
+
+    print("[INFO] Připojuji (async)...")
+    await client.connect()
+    print(f"[OK] CONNECTED | demo={int(PO_DEMO)}")
+    print(f"[OK] START | symbol={SYMBOL} | tf={TIMEFRAME_SEC}s | csv={OUT_CSV} | safe_lag={SAFE_LAG_SEC}s | backfill={int(BACKFILL)}")
+
+    last_saved_ts = 0
+    printed_clock = False
+    last_heartbeat = 0
+
+    tz_off_h: Optional[int] = None
+    skew_sec: int = 0
+    announced = False
+
+    while RUNNING:
+        try:
+            now_epoch = int(time.time())
+
+            if not printed_clock:
+                printed_clock = True
+                now_local = datetime.fromtimestamp(now_epoch)
+                now_utc = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
+                print(f"[TIME] now_local={now_local.isoformat()} | now_utc={now_utc.isoformat()}")
+
+            candles_raw = await client.get_candles(asset=SYMBOL, timeframe=TIMEFRAME_SEC)
+            if not candles_raw:
+                if now_epoch - last_heartbeat >= 10:
+                    last_heartbeat = now_epoch
+                    print(f"[..] empty candles list from API | symbol={SYMBOL}")
+                await asyncio.sleep(POLL_SEC)
+                continue
+
+            tail = candles_raw[-FETCH_LAST_N:]
+
+            # 1) offset+skew detekce
+            if tz_off_h is None:
+                if FORCE_TZ_OFF_H is not None:
+                    tz_off_h = int(FORCE_TZ_OFF_H)
+                else:
+                    dts_naive = [dt for dt in (pick_datetime(x) for x in tail) if isinstance(dt, datetime) and dt.tzinfo is None]
+                    if dts_naive:
+                        tz_off_h, skew_sec = detect_offset_and_skew(dts_naive, now_epoch)
+                    else:
+                        tz_off_h = 0
+
+                if FORCE_SKEW_SEC is not None:
+                    skew_sec = int(FORCE_SKEW_SEC)
+
+                print(f"[OK] detected server_tz_offset={tz_off_h:+d}h | skew_sec={skew_sec}")
+                announced = True
+
+            # 2) parse candles -> epoch
+            candles: List[Candle] = []
+            for x in tail:
+                dt = pick_datetime(x)
+                ts_epoch: Optional[int] = None
+
+                if dt is not None:
+                    if dt.tzinfo is not None:
+                        ts_epoch = int(dt.timestamp())
+                    else:
+                        tz = timezone(timedelta(hours=int(tz_off_h or 0)))
+                        ts_epoch = int(dt.replace(tzinfo=tz).timestamp())
+                else:
+                    ts_epoch = pick_epoch(x)
+
+                if ts_epoch is None:
+                    continue
+
+                ts_epoch = align_open_ts(ts_epoch)
+
+                o = pick_float(x, "open", "o")
+                h = pick_float(x, "high", "h")
+                l = pick_float(x, "low", "l")
+                c = pick_float(x, "close", "c")
+                if o is None or h is None or l is None or c is None:
+                    continue
+
+                candles.append(Candle(ts=ts_epoch, o=o, h=h, l=l, c=c))
+
+            if not candles:
+                if now_epoch - last_heartbeat >= 10:
+                    last_heartbeat = now_epoch
+                    print("[..] parsed 0 candles")
+                await asyncio.sleep(POLL_SEC)
+                continue
+
+            candles.sort(key=lambda z: z.ts)
+
+            adjusted_now = int(time.time()) + int(skew_sec)
+
+            # 3) closed candles
+            closed: List[Candle] = []
+            for cd in candles:
+                close_ts = cd.ts + TIMEFRAME_SEC
+                if close_ts <= (adjusted_now - SAFE_LAG_SEC):
+                    closed.append(cd)
+
+            # 4) anchor (no backfill)
+            if last_saved_ts == 0 and not BACKFILL:
+                if closed:
+                    last_saved_ts = closed[-1].ts
+                    print(f"[INFO] anchored at last CLOSED candle: {fmt_hms_local(last_saved_ts)} (no backfill)")
+                else:
+                    if now_epoch - last_heartbeat >= 10:
+                        last_heartbeat = now_epoch
+                        print("[..] no CLOSED candles yet (waiting)")
+                await asyncio.sleep(POLL_SEC)
+                continue
+
+            new_ones = [cd for cd in closed if cd.ts > last_saved_ts]
+
+            if new_ones:
+                for cd in new_ones:
+                    adjusted_now2 = int(time.time()) + int(skew_sec)
+                    close_ts = cd.ts + TIMEFRAME_SEC
+                    age = adjusted_now2 - close_ts
+                    append_candle_csv(OUT_CSV, SYMBOL, cd, age, int(tz_off_h or 0), int(skew_sec))
+                    print(
+                        f"{fmt_hms_local(cd.ts)}  {SYMBOL}  "
+                        f"O={cd.o:.5f} H={cd.h:.5f} L={cd.l:.5f} C={cd.c:.5f}  "
+                        f"age_sec={age}  tz_off={int(tz_off_h or 0):+d}h  skew_sec={int(skew_sec)}"
+                    )
+                    last_saved_ts = cd.ts
+            else:
+                if now_epoch - last_heartbeat >= 10:
+                    last_heartbeat = now_epoch
+                    last_s = fmt_hms_local(last_saved_ts) if last_saved_ts else "NONE"
+                    print(f"[..] no new CLOSED candles | last_ts={last_s}")
+
+        except Exception as e:
+            print(f"[WARN] loop chyba: {e}")
+
+        await asyncio.sleep(POLL_SEC)
+
+    print("[OK] STOP")
+    await client.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

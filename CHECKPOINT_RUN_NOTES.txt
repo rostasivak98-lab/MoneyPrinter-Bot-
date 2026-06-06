@@ -1,0 +1,12 @@
+Checkpoint before Variant B
+
+Typical env:
+PO_IS_DEMO=1
+PO_TF_SEC=60
+PO_ASSET=CHFJPY_otc
+PO_TS_OFFSET=0
+PO_REQUIRE_CLOSED=1
+
+Notes:
+- get_candles OHLC mismatch vs Pocket UI for OTC observed
+- timestamp is datetime in Candle model

@@ -1,0 +1,30 @@
+PROJECT: New Chance
+PLATFORM: macOS
+PATH: ~/bot-srdce
+
+STABLE STATE:
+- PocketOption DEMO
+- Symbol: CHFJPY_otc
+- M1 candles via STREAM (Playwright WebKit, socket.io updateStream)
+- /api/last?closed=1 returns STREAM candle with age_sec=0
+- NORMAL OHLC matches Pocket UI
+- Heiken Ashi matches Pocket UI (ha_seed.json, seeded=true)
+- Watchdog enabled (start grace 360s)
+- Active mode: STREAM
+- tick_time_mode: minus_offset
+
+ENDPOINTS:
+GET  /api/start
+POST /api/stop
+GET  /api/tick_status
+GET  /api/last
+POST /api/ha_seed
+
+RETURN POINT:
+git tag STABLE_STREAM_M1_V1
+snapshot folder: ~/bot-srdce__STABLE_STREAM_M1_V1
+zip backup: ~/bot-srdce__STABLE_STREAM_M1_V1.zip
+
+RULE:
+Candles are considered stable and validated.
+Do NOT revalidate candle correctness unless tick_status shows failure.

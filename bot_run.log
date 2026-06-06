@@ -1,0 +1,2 @@
+[boot] demo=True tf=60s poll=1.0s count=5 asset=CHFJPY_otc offset=0s
+[ok] connected
