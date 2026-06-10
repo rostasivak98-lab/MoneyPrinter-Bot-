@@ -174,9 +174,15 @@ def worker_healthy(name: str, data: dict):
     if (now() - started_at) < STARTUP_GRACE_SEC:
         return True, "startup_grace_ok"
 
-    # symbol v UI musi po grace sedet
-    if not ui_ok:
-        return False, "ui_symbol_not_ok"
+    # symbol v UI musi po grace sedet, ale PocketOption UI obcas kratce laguje
+    if ui_ok:
+        HEALTH[name]["last_ui_symbol_ok_ts"] = now()
+    else:
+        last_ui_ok = float(HEALTH[name].get("last_ui_symbol_ok_ts") or started_at)
+        ui_bad_for = now() - last_ui_ok
+        if ui_bad_for < STREAM_STUCK_SEC:
+            return True, f"waiting_ui_symbol:{int(ui_bad_for)}s"
+        return False, f"ui_symbol_not_ok:{int(ui_bad_for)}s"
 
     # kdyz je worker uz ve STREAM a ma current, je zdravy
     if active_mode == "STREAM" and has_stream_current and stream_closed_len >= 2:
