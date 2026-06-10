@@ -3,6 +3,7 @@ import uvicorn
 import urllib.request
 import json
 import time
+from pathlib import Path
 from typing import Any, Dict, List
 
 APP = FastAPI(title="stream-coordinator-test")
@@ -646,6 +647,32 @@ def _simple_state_from_internal_and_bias(internal_state: str, market_bias: str) 
 
 
 
+def _build_trade_confidence(zaver, s8, p8, sc8, s12, p12, sc12, s16, p16, sc16):
+    scores = [int(sc8 or 0), int(sc12 or 0), int(sc16 or 0)]
+    max_score = max(scores)
+    avg_score = int(sum(scores) / max(1, len(scores)))
+    chaos_count = [p8, p12, p16].count("CHAOS")
+
+    base = 20
+
+    if "CLEAN BUY" in str(zaver) or "CLEAN SELL" in str(zaver):
+        base = 82
+    elif "PULLBACK" in str(zaver):
+        base = 72
+    elif "BUY" in str(zaver) or "SELL" in str(zaver):
+        base = 60
+    elif "CHAOS" in str(zaver):
+        base = 20
+
+    conf = base + int(max_score * 0.25) + int(avg_score * 0.15)
+    conf -= chaos_count * 10
+
+    if "CHAOS" in str(zaver):
+        conf = min(conf, 35)
+
+    return max(0, min(99, int(conf)))
+
+
 def _build_zaver(s8, p8, sc8, s12, p12, sc12, s16, p16, sc16):
     buy_count = sum(1 for x in [s8, s12, s16] if x == "BUY")
     sell_count = sum(1 for x in [s8, s12, s16] if x == "SELL")
@@ -764,6 +791,21 @@ def coord_structure_debug():
             s16.get("trend_strength", 0),
         )
 
+        trade_confidence = _build_trade_confidence(
+            zaver,
+            s8.get("structure_bias"),
+            s8.get("trend_phase"),
+            s8.get("trend_strength", 0),
+
+            s12.get("structure_bias"),
+            s12.get("trend_phase"),
+            s12.get("trend_strength", 0),
+
+            s16.get("structure_bias"),
+            s16.get("trend_phase"),
+            s16.get("trend_strength", 0),
+        )
+
         items.append({
             "symbol": w["symbol"],
             "ok": True,
@@ -773,12 +815,39 @@ def coord_structure_debug():
             "structure_12": s12,
             "structure_16": s16,
             "zaver": zaver,
+            "trade_confidence": trade_confidence,
         })
+
+    tradable_items = [
+        item for item in items
+        if item.get("ok")
+        and item.get("active_mode") == "STREAM"
+        and "CHAOS" not in str(item.get("zaver"))
+    ]
+
+    best_setup = None
+    if tradable_items:
+        best_setup = max(
+            tradable_items,
+            key=lambda item: int(item.get("trade_confidence") or 0)
+        )
+
+    if best_setup:
+        try:
+            log_path = Path("best_setup_history.log")
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            log_path.open("a", encoding="utf-8").write(
+                f"{ts} | {best_setup.get('symbol')} | {best_setup.get('active_mode')} | "
+                f"{best_setup.get('zaver')} | {best_setup.get('trade_confidence')}%\\n"
+            )
+        except Exception:
+            pass
 
     result = {
         "ok": True,
         "cache_ttl_sec": int(_STRUCTURE_DEBUG_CACHE_TTL),
         "cache_age_sec": 0,
+        "best_setup": best_setup,
         "items": items,
     }
     _STRUCTURE_DEBUG_CACHE = result
