@@ -4398,7 +4398,7 @@ def api_dashboard_simple_scan():
 
 
 @app.get("/api/dashboard/active_feed")
-def api_dashboard_active_feed():
+def api_dashboard_active_feed(symbol: str = ""):
     import json as _json
     import urllib.request as _urlreq
 
@@ -4457,7 +4457,7 @@ def api_dashboard_active_feed():
 
         return out
 
-    active_symbol = str(getattr(STATE, "symbol", "") or "")
+    active_symbol = str(symbol or getattr(STATE, "symbol", "") or "")
     worker_url = worker_defs.get(active_symbol)
     if not worker_url:
         return {
@@ -4499,9 +4499,8 @@ def api_dashboard_active_feed():
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-
-@app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
+    return open("app/templates/dashboard.html", "r", encoding="utf-8").read()
     return """
 <!doctype html>
 <html lang="cs">
