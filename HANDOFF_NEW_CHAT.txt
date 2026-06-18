@@ -118,3 +118,50 @@ PRVNÍ ÚKOL PRO NOVÝ CHAT
   - Posledních 10 uzavřených svíček
 - Vytáhni přesné části app/main.py přes grep/sed/curl
 - Pak navrhni 1 malý bezpečný patch
+
+---
+
+## ✅ HOTOVO: Luxury Dashboard
+
+Dnes byl dokončen nový profesionální dashboard.
+
+### Hotové:
+- Nový dashboard je v:
+  - app/templates/dashboard.html
+
+- /dashboard v app/main.py načítá nový HTML soubor.
+
+- Starý vložený dashboard v app/main.py byl odstraněn.
+
+### Dashboard obsahuje:
+- luxury dark UI
+- welcome intro / splash screen
+- loading bar
+- live HA graf
+- symbol cards pro AUDNZD / EURCHF / CHFJPY
+- klik na symbol přepíná pouze graf, ne bota
+- live Bot status panel
+- live Market panel
+- Last candles
+- barevné stavy NIC / POZOR / VSTUP / ZRUŠENO
+- menu stránky:
+  - Dashboard
+  - Signals
+  - Workers
+  - Telegram
+  - Settings
+
+### Důležité:
+Klikání na symbol v dashboardu nepřepíná skutečného bota.
+Pouze mění zobrazený graf, aby dashboard nesekal a nespouštěl workery.
+
+### Backend změna:
+Endpoint podporuje symbol parametr:
+
+/api/dashboard/active_feed?symbol=AUDNZD_otc
+
+### Git:
+Finální dashboard byl uložen commitem:
+
+af16125 - Add final luxury live dashboard
+
