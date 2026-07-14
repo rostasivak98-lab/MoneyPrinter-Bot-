@@ -6,3 +6,31 @@ po_ssid.txt
 .env
 .DS_Store
 watchdog_logs/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+po_ssid.txt
+**/po_ssid.txt
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Runtime files
+*.log
+*.db
+*.sqlite
+*.sqlite3
+watchdog_logs/
+data/*.csv
+
+# Local backups and checkpoints
+*.bak
+*.bak_*
+*.__before_*
+*.checkpoint_*
+*.FINAL_*
+*.zip

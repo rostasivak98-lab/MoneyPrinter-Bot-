@@ -66,3 +66,11 @@ Poslední update: 2026-06-07
 - vytvořen BOT_SRDCE_HANDOFF.md
 - vytvořen PROJECT_STATE.md
 
+
+## CHECKPOINT 2026-07-14 — Git cleanup
+
+- Cíl první verze: signály pro ruční vstup.
+- Rozšířen `.gitignore` pro ochranu přihlašovacích údajů a lokálních souborů.
+- Python `__pycache__` a `.pyc` soubory odstraněny z evidence Gitu.
+- Zálohy, checkpointy, logy, databáze a ZIP archivy nebudou commitovány.
+- Hlavní Python soubory prošly kontrolou syntaxe.
