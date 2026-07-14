@@ -74,3 +74,11 @@ Poslední update: 2026-06-07
 - Python `__pycache__` a `.pyc` soubory odstraněny z evidence Gitu.
 - Zálohy, checkpointy, logy, databáze a ZIP archivy nebudou commitovány.
 - Hlavní Python soubory prošly kontrolou syntaxe.
+
+## CHECKPOINT 2026-07-14 — best_setup bias guard
+
+- Oprava: best_setup se vybere jen když směr (zaver) souhlasí s market_bias.
+- Přidán market_bias a market_bias_reason do výstupu structure_debug.
+- Ověřeno živě: při market_bias=CHAOS je best_setup správně null.
+- Příklad: EURCHF měl BUY PULLBACK 76 %, ale market_bias=CHAOS → správně odmítnut.
+- py_compile OK, koordinátor restartován přes watchdog.

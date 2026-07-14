@@ -773,6 +773,9 @@ def coord_structure_debug():
             continue
 
         recent_closed = list(data.get("recent_closed") or [])
+        bias_info = _market_bias_from_closed(recent_closed)
+        market_bias = bias_info["market_bias"]
+
         s8 = _structure_bias_from_closed(recent_closed, 8)
         s12 = _structure_bias_from_closed(recent_closed, 12)
         s16 = _structure_bias_from_closed(recent_closed, 16)
@@ -811,6 +814,8 @@ def coord_structure_debug():
             "ok": True,
             "active_mode": data.get("active_mode"),
             "stream_closed_len": data.get("stream_closed_len"),
+            "market_bias": market_bias,
+            "market_bias_reason": bias_info["market_bias_reason"],
             "structure_8": s8,
             "structure_12": s12,
             "structure_16": s16,
@@ -823,6 +828,16 @@ def coord_structure_debug():
         if item.get("ok")
         and item.get("active_mode") == "STREAM"
         and "CHAOS" not in str(item.get("zaver"))
+        and (
+            (
+                "BUY" in str(item.get("zaver"))
+                and item.get("market_bias") == "BUY"
+            )
+            or (
+                "SELL" in str(item.get("zaver"))
+                and item.get("market_bias") == "SELL"
+            )
+        )
     ]
 
     best_setup = None
